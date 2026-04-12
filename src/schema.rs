@@ -54,7 +54,8 @@ CREATE TABLE release (
     notes TEXT NOT NULL DEFAULT '',
     master_id INT,
     status TEXT NOT NULL DEFAULT '',
-    data_quality TEXT NOT NULL DEFAULT ''
+    data_quality TEXT NOT NULL DEFAULT '',
+    search_text TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE release_artist (
@@ -161,6 +162,7 @@ CREATE INDEX idx_master_main_release ON master (main_release_id);
 
 CREATE INDEX idx_release_title_fts ON release USING GIN (to_tsvector('english', title));
 CREATE INDEX idx_artist_name_fts ON artist USING GIN (to_tsvector('english', name));
+CREATE INDEX idx_release_search_text_fts ON release USING GIN (to_tsvector('english', search_text));
 ";
 
 pub const VACUUM_ANALYZE: &str = "\

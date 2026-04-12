@@ -222,3 +222,80 @@ pub struct ApiAlias {
     pub id: i32,
     pub name: String,
 }
+
+// ---------------------------------------------------------------------------
+// Discogs-API-compatible response types (for beets/python3-discogs-client)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsRelease {
+    pub id: i32,
+    pub title: String,
+    pub uri: String,
+    pub year: Option<i32>,
+    pub country: String,
+    pub master_id: Option<i32>,
+    pub data_quality: String,
+    pub artists: Vec<DiscogsArtistCredit>,
+    pub tracklist: Vec<DiscogsTrack>,
+    pub labels: Vec<ApiLabel>,
+    pub formats: Vec<DiscogsFormat>,
+    pub genres: Vec<String>,
+    pub styles: Vec<String>,
+    pub images: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscogsArtistCredit {
+    pub id: i32,
+    pub name: String,
+    pub anv: String,
+    pub join: String,
+    pub role: String,
+    pub tracks: String,
+    pub resource_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsTrack {
+    pub position: String,
+    pub type_: String,
+    pub title: String,
+    pub duration: String,
+    pub artists: Vec<DiscogsArtistCredit>,
+    pub extraartists: Vec<DiscogsArtistCredit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsFormat {
+    pub name: String,
+    pub qty: String,
+    pub descriptions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsMaster {
+    pub id: i32,
+    pub year: Option<i32>,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsSearchResponse {
+    pub pagination: DiscogsPagination,
+    pub results: Vec<DiscogsSearchResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsPagination {
+    pub pages: i32,
+    pub items: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscogsSearchResult {
+    pub id: i32,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub title: String,
+}

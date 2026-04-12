@@ -163,17 +163,19 @@ pub async fn copy_releases(client: &Client, releases: &[Release]) -> anyhow::Res
     // release table
     {
         let sink = client.copy_in(
-            "COPY release (id, title, country, released, notes, master_id, status, data_quality) FROM STDIN WITH (FORMAT binary)"
+            "COPY release (id, title, country, released, notes, master_id, status, data_quality, search_text) FROM STDIN WITH (FORMAT binary)"
         ).await?;
         let mut w = pin!(BinaryCopyInWriter::new(sink, &[
             Type::INT4, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT,
-            Type::INT4, Type::TEXT, Type::TEXT,
+            Type::INT4, Type::TEXT, Type::TEXT, Type::TEXT,
         ]));
         for r in releases {
+            let search_text = build_search_text(&r.title, &r.artists);
             w.as_mut().write(&[
                 &r.id as &(dyn ToSql + Sync),
                 &r.title as _, &r.country as _, &r.released as _, &r.notes as _,
                 &r.master_id as _, &r.status as _, &r.data_quality as _,
+                &search_text as _,
             ]).await?;
         }
         w.as_mut().finish().await?;
@@ -577,6 +579,219 @@ pub async fn query_artist(client: &Client, id: i32) -> anyhow::Result<Option<Art
         aliases,
         namevariations,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Discogs-compatible query helpers (for beets / python3-discogs-client)
+// ---------------------------------------------------------------------------
+
+fn build_search_text(title: &str, artists: &[CreditedArtist]) -> String {
+    let artist_names: Vec<&str> = artists.iter().map(|a| a.artist_name.as_str()).collect();
+    if artist_names.is_empty() {
+        title.to_string()
+    } else {
+        format!("{} {}", artist_names.join(" "), title)
+    }
+}
+
+fn parse_year(released: &str) -> Option<i32> {
+    released.get(..4)
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&y| y > 0)
+}
+
+fn parse_descriptions(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        vec![]
+    } else {
+        s.split(", ").map(|s| s.to_string()).collect()
+    }
+}
+
+pub async fn query_discogs_release(client: &Client, id: i32) -> anyhow::Result<Option<DiscogsRelease>> {
+    let row = match client.query_opt(
+        "SELECT id, title, country, released, master_id, data_quality FROM release WHERE id = $1",
+        &[&id],
+    ).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let artist_rows = client.query(
+        "SELECT artist_id, artist_name, role, anv, join_relation FROM release_artist WHERE release_id = $1",
+        &[&id],
+    ).await?;
+    let artists: Vec<DiscogsArtistCredit> = artist_rows.iter().map(|r| DiscogsArtistCredit {
+        id: r.get("artist_id"),
+        name: r.get("artist_name"),
+        anv: r.get("anv"),
+        join: r.get("join_relation"),
+        role: r.get("role"),
+        tracks: String::new(),
+        resource_url: String::new(),
+    }).collect();
+
+    let label_rows = client.query(
+        "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
+        &[&id],
+    ).await?;
+    let labels: Vec<ApiLabel> = label_rows.iter().map(|r| ApiLabel {
+        id: r.get("label_id"),
+        name: r.get("label_name"),
+        catno: r.get("catno"),
+    }).collect();
+
+    let format_rows = client.query(
+        "SELECT name, qty, descriptions FROM release_format WHERE release_id = $1",
+        &[&id],
+    ).await?;
+    let formats: Vec<DiscogsFormat> = format_rows.iter().map(|r| {
+        let qty: i32 = r.get("qty");
+        let desc: String = r.get("descriptions");
+        DiscogsFormat {
+            name: r.get("name"),
+            qty: qty.to_string(),
+            descriptions: parse_descriptions(&desc),
+        }
+    }).collect();
+
+    let track_rows = client.query(
+        "SELECT sequence, position, title, duration FROM release_track WHERE release_id = $1 ORDER BY sequence",
+        &[&id],
+    ).await?;
+
+    let track_artist_rows = client.query(
+        "SELECT sequence, artist_id, artist_name, role, anv FROM release_track_artist WHERE release_id = $1 ORDER BY sequence",
+        &[&id],
+    ).await?;
+    let mut track_artist_map: HashMap<i32, Vec<DiscogsArtistCredit>> = HashMap::new();
+    for r in &track_artist_rows {
+        let seq: i32 = r.get("sequence");
+        track_artist_map.entry(seq).or_default().push(DiscogsArtistCredit {
+            id: r.get("artist_id"),
+            name: r.get("artist_name"),
+            anv: r.get("anv"),
+            join: String::new(),
+            role: r.get("role"),
+            tracks: String::new(),
+            resource_url: String::new(),
+        });
+    }
+
+    let tracklist: Vec<DiscogsTrack> = track_rows.iter().map(|r| {
+        let seq: i32 = r.get("sequence");
+        DiscogsTrack {
+            position: r.get("position"),
+            type_: "track".to_string(),
+            title: r.get("title"),
+            duration: r.get("duration"),
+            artists: track_artist_map.remove(&seq).unwrap_or_default(),
+            extraartists: vec![],
+        }
+    }).collect();
+
+    let genre_rows = client.query(
+        "SELECT genre FROM release_genre WHERE release_id = $1", &[&id],
+    ).await?;
+    let genres: Vec<String> = genre_rows.iter().map(|r| r.get("genre")).collect();
+
+    let style_rows = client.query(
+        "SELECT style FROM release_style WHERE release_id = $1", &[&id],
+    ).await?;
+    let styles: Vec<String> = style_rows.iter().map(|r| r.get("style")).collect();
+
+    let released: String = row.get("released");
+
+    Ok(Some(DiscogsRelease {
+        id,
+        title: row.get("title"),
+        uri: format!("https://www.discogs.com/release/{id}"),
+        year: parse_year(&released),
+        country: row.get("country"),
+        master_id: row.get("master_id"),
+        data_quality: row.get("data_quality"),
+        artists,
+        tracklist,
+        labels,
+        formats,
+        genres,
+        styles,
+        images: vec![],
+    }))
+}
+
+pub async fn query_discogs_master(client: &Client, id: i32) -> anyhow::Result<Option<DiscogsMaster>> {
+    let row = match client.query_opt(
+        "SELECT id, title, year FROM master WHERE id = $1",
+        &[&id],
+    ).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    Ok(Some(DiscogsMaster {
+        id,
+        title: row.get("title"),
+        year: row.get("year"),
+    }))
+}
+
+pub async fn query_discogs_search(
+    client: &Client,
+    q: &str,
+    per_page: i32,
+    page: i32,
+) -> anyhow::Result<DiscogsSearchResponse> {
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let limit = (per_page + 1) as i64; // fetch one extra to detect more pages
+    let offset = ((page - 1) as i64) * (per_page as i64);
+
+    let rows = client.query(
+        "SELECT r.id, r.title,
+                (SELECT ra.artist_name FROM release_artist ra WHERE ra.release_id = r.id LIMIT 1) as artist_name
+         FROM release r
+         WHERE to_tsvector('english', r.search_text) @@ plainto_tsquery('english', $1)
+         ORDER BY ts_rank(to_tsvector('english', r.search_text), plainto_tsquery('english', $1)) DESC
+         LIMIT $2 OFFSET $3",
+        &[&q, &limit, &offset],
+    ).await?;
+
+    let has_more = rows.len() > per_page as usize;
+    let result_rows = if has_more { &rows[..per_page as usize] } else { &rows[..] };
+
+    let results: Vec<DiscogsSearchResult> = result_rows.iter().map(|r| {
+        let id: i32 = r.get("id");
+        let title: String = r.get("title");
+        let artist_name: Option<String> = r.get("artist_name");
+        let display_title = match artist_name {
+            Some(a) if !a.is_empty() => format!("{a} - {title}"),
+            _ => title,
+        };
+        DiscogsSearchResult {
+            id,
+            type_: "release".to_string(),
+            title: display_title,
+        }
+    }).collect();
+
+    let total_on_page = result_rows.len() as i64;
+    let items = if has_more {
+        // More results exist beyond this page; estimate conservatively
+        offset + total_on_page + 1
+    } else {
+        offset + total_on_page
+    };
+    let pages = if per_page > 0 {
+        ((items as f64) / (per_page as f64)).ceil() as i32
+    } else {
+        1
+    };
+
+    Ok(DiscogsSearchResponse {
+        pagination: DiscogsPagination { pages, items },
+        results,
+    })
 }
 
 // ---------------------------------------------------------------------------

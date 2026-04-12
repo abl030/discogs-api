@@ -40,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/releases/{id}", get(get_release))
         .route("/api/masters/{id}", get(get_master))
         .route("/api/artists/{id}", get(get_artist))
+        // Discogs-API-compatible routes (for beets / python3-discogs-client)
+        .route("/releases/{id}", get(discogs_get_release))
+        .route("/masters/{id}", get(discogs_get_master))
+        .route("/database/search", get(discogs_search))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", args.port);
@@ -63,6 +67,13 @@ struct SearchParams {
     title: Option<String>,
     page: Option<i32>,
     per_page: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct DiscogsSearchParams {
+    q: Option<String>,
+    per_page: Option<i32>,
+    page: Option<i32>,
 }
 
 async fn search(
@@ -111,4 +122,51 @@ async fn get_artist(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => { tracing::error!("artist query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Discogs-API-compatible handlers (for beets / python3-discogs-client)
+// ---------------------------------------------------------------------------
+
+async fn discogs_get_release(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<DiscogsRelease>, StatusCode> {
+    match db::query_discogs_release(&state.client, id).await {
+        Ok(Some(r)) => Ok(Json(r)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { tracing::error!("discogs release query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+    }
+}
+
+async fn discogs_get_master(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<DiscogsMaster>, StatusCode> {
+    match db::query_discogs_master(&state.client, id).await {
+        Ok(Some(m)) => Ok(Json(m)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { tracing::error!("discogs master query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+    }
+}
+
+async fn discogs_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DiscogsSearchParams>,
+) -> Result<Json<DiscogsSearchResponse>, StatusCode> {
+    let q = match params.q {
+        Some(ref q) if !q.is_empty() => q.as_str(),
+        _ => return Ok(Json(DiscogsSearchResponse {
+            pagination: DiscogsPagination { pages: 0, items: 0 },
+            results: vec![],
+        })),
+    };
+    db::query_discogs_search(
+        &state.client,
+        q,
+        params.per_page.unwrap_or(5),
+        params.page.unwrap_or(1),
+    ).await
+        .map(Json)
+        .map_err(|e| { tracing::error!("discogs search error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })
 }
