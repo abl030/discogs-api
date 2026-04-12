@@ -1,4 +1,2 @@
-__pycache__/
-*.pyc
-*.egg-info/
+/target
 .mcp.json

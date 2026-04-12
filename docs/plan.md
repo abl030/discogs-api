@@ -27,7 +27,7 @@ data.discogs.com (monthly XML dumps)
               v
 +-----------------------------+
 | discogs-api (systemd)       |
-| Python http.server          |
+| axum HTTP server            |
 | port 8086                   |
 | discogs.ablz.au             |
 +-----------------------------+
@@ -36,22 +36,36 @@ data.discogs.com (monthly XML dumps)
 ## Repo Structure
 
 ```
-discogs/
-  importer.py    -- Downloads XML dumps, parses them, loads into Postgres via COPY.
-                    Takes --dsn and --dump-dir as CLI args.
-  server.py      -- HTTP JSON API server. Takes --port and --dsn as CLI args.
-  schema.sql     -- DDL for all tables + indexes.
-  types.py       -- Typed dataclasses for parsed XML elements.
+src/
+  import.rs      -- Binary: downloads XML dumps, streams into Postgres via COPY
+  server.rs      -- Binary: axum HTTP JSON API server
+  schema.rs      -- DDL constants (CREATE TABLE statements)
+  types.rs       -- Typed structs for parsed XML elements (serde)
+  xml.rs         -- Streaming XML parser (quick-xml iterparse)
+  db.rs          -- Postgres helpers (connection, COPY, queries)
+  lib.rs         -- Shared library root
 tests/
-  test_importer.py  -- Pure function + XML parsing tests
-  test_server.py    -- Contract tests with REQUIRED_FIELDS per endpoint
+  integration/   -- Integration tests (real HTTP, mocked DB)
 docs/
-  plan.md           -- This file
+  plan.md        -- This file
 ```
 
-Pure application code -- no infrastructure awareness. These could run anywhere with a Postgres DSN.
+Two binaries from one crate: `discogs-import` (oneshot importer) and `discogs-api` (long-running server). Shared types and DB code in the library.
 
-The NixOS module lives in nixosconfig (`discogs.nix`) -- same pattern as soularr itself.
+The NixOS module lives in nixosconfig (`discogs.nix`) — same pattern as soularr.
+
+## Key Dependencies
+
+| Crate | Purpose |
+|-------|---------|
+| `quick-xml` | Streaming XML parser (no full DOM, iterparse style) |
+| `flate2` | Gzip decompression for .xml.gz dumps |
+| `tokio-postgres` | Async Postgres client with COPY support |
+| `axum` | HTTP server framework |
+| `clap` | CLI arg parsing (`--dsn`, `--dump-dir`, `--port`) |
+| `reqwest` | HTTP client for downloading dumps |
+| `serde` / `serde_json` | JSON serialization for API responses |
+| `tracing` | Structured logging |
 
 ## Data Source
 
@@ -97,15 +111,15 @@ CREATE TABLE import_meta (key TEXT PRIMARY KEY, value TEXT);
 
 Full-text search (GIN) on `release.title` and `artist.name`. B-tree on all foreign keys for join performance.
 
-## Importer
+## Importer (`discogs-import`)
 
 ### Strategy
 
-Custom Python streaming XML parser. Streams each XML.gz file through `ET.iterparse()`, builds typed dataclass instances per element, flushes in COPY batches (50k rows) to Postgres. No full DOM in memory.
+Streaming XML parser via `quick-xml`. Reads each .xml.gz through `flate2::read::GzDecoder`, parses element-by-element (no DOM), builds typed structs, flushes in COPY batches to Postgres. Memory usage stays flat regardless of dump size.
 
 ### Import cycle
 
-1. Discover latest dump date from data.discogs.com
+1. Discover latest dump date from data.discogs.com (HTML scrape)
 2. Download any missing XML.gz files to `--dump-dir`
 3. DROP CASCADE + CREATE all tables (full replacement, no incremental)
 4. Import artists -> labels -> masters -> releases (with all junction tables)
@@ -115,18 +129,18 @@ Custom Python streaming XML parser. Streams each XML.gz file through `ET.iterpar
 
 ### Performance
 
-Python with COPY: ~1-2 hours for full import. Acceptable given monthly cadence.
+Rust with streaming COPY: expect ~15-30 minutes for full import. The XML parsing and tab-escaping are CPU-bound — Rust makes this fast. Bottleneck will be Postgres COPY throughput.
 
 ### Monthly timer
 
 ```
 OnCalendar = *-*-02 04:00:00  (2nd of month, after dumps publish on 1st)
-TimeoutStartSec = 4h
+TimeoutStartSec = 2h
 ```
 
-## API Server
+## API Server (`discogs-api`)
 
-Python `http.server`, same pattern as soularr-web. Short-lived per-request DB connections via `psycopg2`.
+axum with `tokio-postgres` connection pool. JSON responses via serde.
 
 ### Endpoints
 
@@ -151,38 +165,18 @@ GET /api/artists/{id}
 
 Uses `to_tsvector('english', ...)` / `plainto_tsquery('english', ...)` with GIN indexes. Artist search uses an EXISTS subquery against `release_artist`. Results enriched with artists/labels/formats per release.
 
-## Test Plan
-
-### Importer tests (`tests/test_importer.py`)
-
-- Pure function tests: `_tab_escape`, `_text` (COPY format escaping, XML text extraction)
-- XML parsing tests: `parse_artist_element`, `parse_label_element`, `parse_master_element`, `parse_release_element` -- each returns a typed dataclass
-- Dump date discovery: `discover_latest_dump_date_from_html` (HTML scraping pure function)
-
-### Server contract tests (`tests/test_server.py`)
-
-- `REQUIRED_FIELDS` per endpoint -- fields the consumer relies on
-- Real HTTP server on random port with mocked DB cursor
-- 404 handling, error responses, CORS headers
-- Pagination fields present
-
-### What's NOT tested in unit tests
-
-- Actual network downloads (integration test / manual)
-- Full XML.gz streaming into PG (too slow for CI, tested manually on first import)
-- Index build performance
-
 ## Implementation Order
 
-1. Write tests (RED) -- importer pure functions + server contract tests
-2. Write `discogs/types.py` -- typed dataclasses for parsed elements
-3. Write `discogs/importer.py` -- makes importer tests GREEN
-4. Write `discogs/server.py` -- makes server tests GREEN
-5. Write `discogs/schema.sql` -- DDL
-6. Write `nixosconfig/modules/nixos/services/discogs.nix`
-7. Enable in doc2 config, deploy, verify PG is up
-8. Run first import manually (`sudo discogs-import`)
-9. Verify API: `curl https://discogs.ablz.au/health`
+1. `src/types.rs` — structs for all parsed entities + API responses (serde)
+2. `src/schema.rs` — DDL as constants
+3. `src/xml.rs` — streaming XML parser, returns typed structs
+4. `src/db.rs` — Postgres COPY helper, query helpers
+5. `src/import.rs` — wires xml + db together, CLI args
+6. `src/server.rs` — axum routes, wires db queries to JSON
+7. `src/lib.rs` — re-exports shared modules
+8. Tests — unit tests inline (`#[cfg(test)]`), integration tests in `tests/`
+9. NixOS module in nixosconfig (`discogs.nix`)
+10. Deploy, first import, verify API
 
 ## NixOS Module (in nixosconfig)
 
@@ -205,12 +199,16 @@ homelab.services.discogs = {
 | `discogs-import.timer` | timer | Monthly trigger (2nd, 04:00) |
 | `discogs-api.service` | simple | JSON API server (port 8086) |
 
+### Build
+
+Nix builds the Rust crate with `rustPlatform.buildRustPackage`. Produces two binaries: `discogs-import` and `discogs-api`. No runtime dependencies beyond the binaries themselves (static linking where possible).
+
 ### Storage
 
-- `/mnt/mirrors/discogs/postgres` -- PG data dir (bind-mounted into container)
-- `/mnt/mirrors/discogs/dumps` -- cached XML.gz files
+- `/mnt/mirrors/discogs/postgres` — PG data dir (bind-mounted into container)
+- `/mnt/mirrors/discogs/dumps` — cached XML.gz files
 
-All under `/mnt/mirrors/` -- re-downloadable, NOT backed up. Same tier as MB mirror pgdata/solrdata.
+All under `/mnt/mirrors/` — re-downloadable, NOT backed up. Same tier as MB mirror pgdata/solrdata.
 
 ### Integration
 
@@ -244,4 +242,4 @@ Once the mirror + API are stable:
 - Dual-search in music.ablz.au (MB + Discogs results side by side)
 - Cross-reference Discogs releases with MB releases for disambiguation
 - Use Discogs format details (pressing weight, color, country) to identify specific pressings
-- Resolve Discogs-sourced albums in the pipeline (currently blocked -- numeric IDs, no MB UUID)
+- Resolve Discogs-sourced albums in the pipeline (currently blocked — numeric IDs, no MB UUID)
