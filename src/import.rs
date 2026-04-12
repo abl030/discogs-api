@@ -116,19 +116,23 @@ async fn discover_latest_dump() -> anyhow::Result<String> {
 async fn download_dump(dump_dir: &Path, date: &str, entity: &str) -> anyhow::Result<()> {
     let filename = format!("discogs_{date}_{entity}s.xml.gz");
     let path = dump_dir.join(&filename);
+    let partial = dump_dir.join(format!("{filename}.partial"));
+
     if path.exists() {
         tracing::info!("{filename} exists, skipping download");
         return Ok(());
     }
 
+    // Clean up any leftover partial download
+    let _ = tokio::fs::remove_file(&partial).await;
+
     let year = &date[..4];
-    // data.discogs.com uses ?download= query param for actual file downloads
     let url = format!("https://data.discogs.com/?download=data/{year}/{filename}");
     tracing::info!("downloading {filename}...");
 
     let resp = reqwest::get(&url).await?.error_for_status()?;
     let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(&path).await?;
+    let mut file = tokio::fs::File::create(&partial).await?;
     let mut bytes_written = 0u64;
 
     while let Some(chunk) = stream.next().await {
@@ -137,6 +141,10 @@ async fn download_dump(dump_dir: &Path, date: &str, entity: &str) -> anyhow::Res
         bytes_written += chunk.len() as u64;
     }
     file.flush().await?;
+    drop(file);
+
+    // Atomic rename — only a complete file gets the final name
+    tokio::fs::rename(&partial, &path).await?;
 
     tracing::info!("downloaded {filename} ({} MB)", bytes_written / 1_000_000);
     Ok(())
