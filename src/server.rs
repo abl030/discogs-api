@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/releases/{id}", get(get_release))
         .route("/api/masters/{id}", get(get_master))
         .route("/api/artists/{id}", get(get_artist))
+        .route("/api/artists/{id}/releases", get(get_artist_releases))
         // Discogs-API-compatible routes (for beets / python3-discogs-client)
         .route("/releases/{id}", get(discogs_get_release))
         .route("/masters/{id}", get(discogs_get_master))
@@ -121,6 +122,29 @@ async fn get_artist(
         Ok(Some(a)) => Ok(Json(a)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => { tracing::error!("artist query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+    }
+}
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    page: Option<i32>,
+    per_page: Option<i32>,
+}
+
+async fn get_artist_releases(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<ArtistReleasesResponse>, StatusCode> {
+    match db::query_artist_releases(
+        &state.client,
+        id,
+        params.page.unwrap_or(1),
+        params.per_page.unwrap_or(100),
+    ).await {
+        Ok(Some(r)) => Ok(Json(r)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { tracing::error!("artist releases query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
     }
 }
 

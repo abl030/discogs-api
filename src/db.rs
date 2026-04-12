@@ -587,6 +587,74 @@ pub async fn query_artist(client: &Client, id: i32) -> anyhow::Result<Option<Art
     }))
 }
 
+pub async fn query_artist_releases(
+    client: &Client,
+    artist_id: i32,
+    page: i32,
+    per_page: i32,
+) -> anyhow::Result<Option<ArtistReleasesResponse>> {
+    // Check artist exists
+    let exists = client.query_opt(
+        "SELECT 1 FROM artist WHERE id = $1", &[&artist_id],
+    ).await?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let limit = per_page as i64;
+    let offset = (page as i64 - 1) * limit;
+
+    let count_row = client.query_one(
+        "SELECT count(*) AS cnt FROM release r JOIN release_artist ra ON ra.release_id = r.id WHERE ra.artist_id = $1",
+        &[&artist_id],
+    ).await?;
+    let total: i64 = count_row.get("cnt");
+
+    let rows = client.query(
+        "SELECT r.id, r.title, r.country, r.released, r.master_id
+         FROM release r
+         JOIN release_artist ra ON ra.release_id = r.id
+         WHERE ra.artist_id = $1
+         ORDER BY r.released, r.id
+         LIMIT $2 OFFSET $3",
+        &[&artist_id, &limit, &offset],
+    ).await?;
+
+    let release_ids: Vec<i32> = rows.iter().map(|r| r.get("id")).collect();
+    let (artist_map, label_map, format_map) = if release_ids.is_empty() {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    } else {
+        fetch_release_enrichments(client, &release_ids).await?
+    };
+
+    let results = rows.iter().map(|r| {
+        let id: i32 = r.get("id");
+        SearchResult {
+            id,
+            title: r.get("title"),
+            country: r.get("country"),
+            released: r.get("released"),
+            master_id: r.get("master_id"),
+            artists: artist_map.get(&id).cloned().unwrap_or_default(),
+            labels: label_map.get(&id).cloned().unwrap_or_default(),
+            formats: format_map.get(&id).cloned().unwrap_or_default(),
+        }
+    }).collect();
+
+    let pages = if per_page > 0 {
+        ((total as f64) / (per_page as f64)).ceil() as i32
+    } else {
+        1
+    };
+
+    Ok(Some(ArtistReleasesResponse {
+        results,
+        pagination: Pagination { page, per_page, pages, items: total },
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Discogs-compatible query helpers (for beets / python3-discogs-client)
 // ---------------------------------------------------------------------------

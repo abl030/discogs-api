@@ -176,6 +176,20 @@ pub struct ArtistDetail {
     pub namevariations: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtistReleasesResponse {
+    pub results: Vec<SearchResult>,
+    pub pagination: Pagination,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Pagination {
+    pub page: i32,
+    pub per_page: i32,
+    pub pages: i32,
+    pub items: i64,
+}
+
 // Shared API sub-types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
