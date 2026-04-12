@@ -79,9 +79,28 @@ fn dump_path(dump_dir: &Path, date: &str, entity: &str) -> PathBuf {
 }
 
 async fn discover_latest_dump() -> anyhow::Result<String> {
-    let html = reqwest::get("https://data.discogs.com/").await?.text().await?;
+    // Index page lists years; we need to fetch the latest year page to find dumps
+    let index = reqwest::get("https://data.discogs.com/").await?.text().await?;
+
+    // Find the latest year listed (e.g. "data%2F2026%2F")
+    let mut years: Vec<String> = Vec::new();
+    for segment in index.split("prefix=data%2F") {
+        if segment.len() >= 4 {
+            let maybe_year = &segment[..4];
+            if maybe_year.bytes().all(|b| b.is_ascii_digit()) {
+                years.push(maybe_year.to_string());
+            }
+        }
+    }
+    years.sort();
+    let year = years.last().ok_or_else(|| anyhow::anyhow!("no years found on data.discogs.com"))?;
+
+    // Fetch the year page to find dump dates
+    let year_url = format!("https://data.discogs.com/?prefix=data%2F{year}%2F");
+    let year_page = reqwest::get(&year_url).await?.text().await?;
+
     let mut dates: Vec<String> = Vec::new();
-    for segment in html.split("discogs_") {
+    for segment in year_page.split("discogs_") {
         if segment.len() >= 8 {
             let maybe_date = &segment[..8];
             if maybe_date.bytes().all(|b| b.is_ascii_digit()) {
@@ -91,7 +110,7 @@ async fn discover_latest_dump() -> anyhow::Result<String> {
     }
     dates.sort();
     dates.dedup();
-    dates.last().cloned().ok_or_else(|| anyhow::anyhow!("no dumps found on data.discogs.com"))
+    dates.last().cloned().ok_or_else(|| anyhow::anyhow!("no dumps found for {year} on data.discogs.com"))
 }
 
 async fn download_dump(dump_dir: &Path, date: &str, entity: &str) -> anyhow::Result<()> {
@@ -103,7 +122,8 @@ async fn download_dump(dump_dir: &Path, date: &str, entity: &str) -> anyhow::Res
     }
 
     let year = &date[..4];
-    let url = format!("https://discogs-data-dumps.s3-us-west-2.amazonaws.com/data/{year}/{filename}");
+    // data.discogs.com uses ?download= query param for actual file downloads
+    let url = format!("https://data.discogs.com/?download=data/{year}/{filename}");
     tracing::info!("downloading {filename}...");
 
     let resp = reqwest::get(&url).await?.error_for_status()?;
