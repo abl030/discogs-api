@@ -163,4 +163,21 @@ CREATE INDEX idx_release_title_fts ON release USING GIN (to_tsvector('english', 
 CREATE INDEX idx_artist_name_fts ON artist USING GIN (to_tsvector('english', name));
 ";
 
-pub const VACUUM_ANALYZE: &str = "VACUUM ANALYZE";
+pub const VACUUM_ANALYZE: &str = "\
+VACUUM ANALYZE artist;
+VACUUM ANALYZE label;
+VACUUM ANALYZE master;
+VACUUM ANALYZE release;
+VACUUM ANALYZE release_artist;
+VACUUM ANALYZE release_label;
+VACUUM ANALYZE release_format;
+VACUUM ANALYZE release_track;
+VACUUM ANALYZE release_track_artist;
+VACUUM ANALYZE release_genre;
+VACUUM ANALYZE release_style;
+VACUUM ANALYZE release_identifier;
+VACUUM ANALYZE artist_alias;
+VACUUM ANALYZE artist_namevariation;
+VACUUM ANALYZE master_artist;
+VACUUM ANALYZE import_meta;
+";

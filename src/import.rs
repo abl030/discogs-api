@@ -66,6 +66,9 @@ async fn main() -> anyhow::Result<()> {
     db::insert_meta(&client, "last_import", &now).await?;
     db::insert_meta(&client, "dump_date", &date).await?;
 
+    // Clean up old dump files
+    cleanup_old_dumps(&args.dump_dir, &date)?;
+
     tracing::info!("import complete");
     Ok(())
 }
@@ -147,6 +150,25 @@ async fn download_dump(dump_dir: &Path, date: &str, entity: &str) -> anyhow::Res
     tokio::fs::rename(&partial, &path).await?;
 
     tracing::info!("downloaded {filename} ({} MB)", bytes_written / 1_000_000);
+    Ok(())
+}
+
+fn cleanup_old_dumps(dump_dir: &Path, current_date: &str) -> anyhow::Result<()> {
+    let keep_prefix = format!("discogs_{current_date}_");
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dump_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("discogs_") && !name.starts_with(&keep_prefix) {
+            std::fs::remove_file(entry.path())?;
+            tracing::info!("removed old dump: {name}");
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!("cleaned up {removed} old dump files");
+    }
     Ok(())
 }
 
