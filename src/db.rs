@@ -42,7 +42,13 @@ pub async fn build_indexes(client: &Client) -> anyhow::Result<()> {
 
 pub async fn vacuum(client: &Client) -> anyhow::Result<()> {
     tracing::info!("running VACUUM ANALYZE...");
-    client.batch_execute(schema::VACUUM_ANALYZE).await?;
+    // VACUUM cannot run inside a transaction block, so execute each statement
+    // individually (batch_execute wraps in an implicit transaction).
+    for line in schema::VACUUM_ANALYZE.lines() {
+        let stmt = line.trim();
+        if stmt.is_empty() { continue; }
+        client.execute(stmt, &[]).await?;
+    }
     Ok(())
 }
 
