@@ -333,22 +333,31 @@ pub async fn insert_meta(client: &Client, key: &str, value: &str) -> anyhow::Res
 // ---------------------------------------------------------------------------
 
 pub async fn query_health(client: &Client) -> anyhow::Result<HealthResponse> {
-    let row = client.query_one(
-        "SELECT COALESCE((SELECT count(*) FROM release), 0) AS cnt",
-        &[],
-    ).await?;
-    let releases: i64 = row.get("cnt");
+    // Tables may not exist before first import — handle gracefully
+    let releases = match client.query_one(
+        "SELECT count(*) AS cnt FROM release", &[],
+    ).await {
+        Ok(row) => row.get::<_, i64>("cnt"),
+        Err(_) => 0,
+    };
 
-    let last_import = client.query_opt(
+    let last_import = match client.query_opt(
         "SELECT value FROM import_meta WHERE key = 'last_import'", &[],
-    ).await?.map(|r| r.get::<_, String>("value")).unwrap_or_default();
+    ).await {
+        Ok(Some(r)) => r.get::<_, String>("value"),
+        _ => String::new(),
+    };
 
-    let dump_date = client.query_opt(
+    let dump_date = match client.query_opt(
         "SELECT value FROM import_meta WHERE key = 'dump_date'", &[],
-    ).await?.map(|r| r.get::<_, String>("value")).unwrap_or_default();
+    ).await {
+        Ok(Some(r)) => r.get::<_, String>("value"),
+        _ => String::new(),
+    };
 
+    let status = if releases > 0 { "ok" } else { "awaiting_import" };
     Ok(HealthResponse {
-        status: "ok".to_string(),
+        status: status.to_string(),
         releases,
         last_import,
         dump_date,
