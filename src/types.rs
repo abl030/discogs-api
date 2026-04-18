@@ -126,6 +126,12 @@ pub struct SearchResult {
     pub country: String,
     pub released: String,
     pub master_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_first_released: Option<String>,
+    pub primary_type: String,
+    pub score: f32,
     pub artists: Vec<ApiArtistCredit>,
     pub labels: Vec<ApiLabel>,
     pub formats: Vec<ApiFormat>,
@@ -153,6 +159,10 @@ pub struct MasterDetail {
     pub title: String,
     pub year: Option<i32>,
     pub main_release_id: Option<i32>,
+    pub primary_type: String,
+    pub first_release_date: String,
+    pub artist_credit: String,
+    pub primary_artist_id: Option<i32>,
     pub artists: Vec<ApiArtistCredit>,
     pub releases: Vec<MasterRelease>,
 }
@@ -180,6 +190,49 @@ pub struct ArtistDetail {
 pub struct ArtistReleasesResponse {
     pub results: Vec<SearchResult>,
     pub pagination: Pagination,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtistSearchResponse {
+    pub results: Vec<ArtistSearchResult>,
+    pub total: i64,
+    pub page: i32,
+    pub per_page: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtistSearchResult {
+    pub id: i32,
+    pub name: String,
+    pub profile: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtistMastersResponse {
+    pub results: Vec<ArtistMasterEntry>,
+    pub total: i64,
+    pub page: i32,
+    pub per_page: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtistMasterEntry {
+    pub id: MasterEntryId,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub first_release_date: String,
+    pub artist_credit: String,
+    pub primary_artist_id: Option<i32>,
+    pub is_masterless: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MasterEntryId {
+    Master(i32),
+    Release(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
