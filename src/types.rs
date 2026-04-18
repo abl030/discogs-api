@@ -172,6 +172,8 @@ pub struct MasterRelease {
     pub id: i32,
     pub title: String,
     pub country: String,
+    pub released: String,
+    pub track_count: i32,
     pub formats: Vec<ApiFormat>,
     pub labels: Vec<ApiLabel>,
 }

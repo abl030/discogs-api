@@ -571,6 +571,16 @@ pub async fn query_master(client: &Client, id: i32) -> anyhow::Result<Option<Mas
         fetch_release_enrichments(client, &release_ids).await?
     };
 
+    let track_count_map: HashMap<i32, i32> = if release_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let track_rows = client.query(
+            "SELECT release_id, COUNT(*)::INT AS c FROM release_track WHERE release_id = ANY($1) GROUP BY release_id",
+            &[&release_ids],
+        ).await?;
+        track_rows.iter().map(|r| (r.get::<_, i32>("release_id"), r.get::<_, i32>("c"))).collect()
+    };
+
     // Pick rep release for primary_type: main_release_id if present, else the
     // earliest-dated release, else the first by id.
     let rep_release_id: Option<i32> = main_release_id
@@ -600,6 +610,8 @@ pub async fn query_master(client: &Client, id: i32) -> anyhow::Result<Option<Mas
             id: rid,
             title: r.get("title"),
             country: r.get("country"),
+            released: r.get("released"),
+            track_count: track_count_map.get(&rid).copied().unwrap_or(0),
             formats: format_map.get(&rid).cloned().unwrap_or_default(),
             labels: label_map.get(&rid).cloned().unwrap_or_default(),
         }
