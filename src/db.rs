@@ -1,36 +1,12 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::pin::pin;
 
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls};
 
 use crate::schema;
 use crate::types::*;
-
-/// Sentinel error raised when a label-releases query exceeds the
-/// per-statement timeout we install around the recursive CTE branch.
-/// The HTTP layer downcasts this to return 503 to the caller, instead
-/// of a generic 500. UMG-class labels with full sub-label rollup can
-/// take 30+ seconds against the mirror; the single-threaded HTTP server
-/// in cratedigger means a single slow request freezes the entire web
-/// UI, so we fail fast and let the caller retry without sub-labels.
-#[derive(Debug)]
-pub struct LabelReleasesTimeout;
-
-impl fmt::Display for LabelReleasesTimeout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "label releases query exceeded statement_timeout")
-    }
-}
-
-impl std::error::Error for LabelReleasesTimeout {}
-
-fn is_query_canceled(err: &tokio_postgres::Error) -> bool {
-    err.code() == Some(&SqlState::QUERY_CANCELED)
-}
 
 // ---------------------------------------------------------------------------
 // Connection
@@ -1035,41 +1011,6 @@ pub async fn query_label(client: &Client, id: i32) -> anyhow::Result<Option<Labe
     }))
 }
 
-/// Run the count + fetch queries inside an open transaction, after
-/// applying `SET LOCAL statement_timeout = '5s'`. On `query_canceled`
-/// (SQLSTATE 57014) returns `LabelReleasesTimeout`. The caller is
-/// responsible for the surrounding `BEGIN` / `COMMIT` / `ROLLBACK`.
-async fn run_label_releases_with_timeout(
-    client: &Client,
-    count_sql: &str,
-    fetch_sql: &str,
-    label_id: i32,
-    limit: i64,
-    offset: i64,
-) -> anyhow::Result<(tokio_postgres::Row, Vec<tokio_postgres::Row>)> {
-    client
-        .execute("SET LOCAL statement_timeout = '5s'", &[])
-        .await?;
-    let count_row = client.query_one(count_sql, &[&label_id]).await.map_err(|e| {
-        if is_query_canceled(&e) {
-            anyhow::Error::new(LabelReleasesTimeout)
-        } else {
-            anyhow::Error::new(e)
-        }
-    })?;
-    let rows = client
-        .query(fetch_sql, &[&label_id, &limit, &offset])
-        .await
-        .map_err(|e| {
-            if is_query_canceled(&e) {
-                anyhow::Error::new(LabelReleasesTimeout)
-            } else {
-                anyhow::Error::new(e)
-            }
-        })?;
-    Ok((count_row, rows))
-}
-
 pub async fn query_label_releases(
     client: &Client,
     label_id: i32,
@@ -1131,74 +1072,31 @@ pub async fn query_label_releases(
              LIMIT $2 OFFSET $3",
         )
     } else {
-        // The inner SELECT must be DISTINCT ON (r.id) ORDER BY r.id, ... so
-        // Postgres can apply the deduplication; the outer wrapper then orders
-        // the deduped rows by released year + id, mirroring the matched-CTE
-        // pattern above. Without the wrapper the result was ordered by r.id,
-        // not by year — pagination produced an arbitrary slice instead of
-        // the chronological window the frontend expects.
         (
             "SELECT count(DISTINCT r.id) AS cnt
              FROM release r
              JOIN release_label rl ON rl.release_id = r.id
              WHERE rl.label_id = $1",
-            "SELECT id, title, country, released, master_id, via_label_id,
-                    master_title, master_first_released, sub_label_name
-             FROM (
-                 SELECT DISTINCT ON (r.id)
-                        r.id, r.title, r.country, r.released, r.master_id,
-                        $1::int AS via_label_id,
-                        m.title AS master_title,
-                        (SELECT MIN(r2.released) FROM release r2
-                           WHERE r2.master_id = r.master_id AND r2.released <> '') AS master_first_released,
-                        NULL::text AS sub_label_name
-                 FROM release r
-                 JOIN release_label rl ON rl.release_id = r.id
-                 LEFT JOIN master m ON m.id = r.master_id
-                 WHERE rl.label_id = $1
-                 ORDER BY r.id
-             ) deduped
-             ORDER BY released, id
+            "SELECT DISTINCT ON (r.id)
+                    r.id, r.title, r.country, r.released, r.master_id,
+                    $1::int AS via_label_id,
+                    m.title AS master_title,
+                    (SELECT MIN(r2.released) FROM release r2
+                       WHERE r2.master_id = r.master_id AND r2.released <> '') AS master_first_released,
+                    NULL::text AS sub_label_name
+             FROM release r
+             JOIN release_label rl ON rl.release_id = r.id
+             LEFT JOIN master m ON m.id = r.master_id
+             WHERE rl.label_id = $1
+             ORDER BY r.id, r.released, r.id
              LIMIT $2 OFFSET $3",
         )
     };
 
-    // The recursive CTE branch can run for 30+ seconds on UMG-class labels.
-    // Cratedigger's web server is single-threaded HTTPServer, so a slow
-    // request freezes the whole UI. Wrap that branch in a transaction with a
-    // 5s statement_timeout and surface query_canceled (SQLSTATE 57014) as a
-    // typed `LabelReleasesTimeout` error — the HTTP handler maps it to 503.
-    // The non-recursive branch runs in milliseconds, so we keep the existing
-    // implicit-transaction path.
-    let (count_row, rows) = if include_sublabels {
-        // The shared `Client` is held behind `&` (one connection per process),
-        // so we can't grab `Client::transaction(&mut self)`. Drive BEGIN /
-        // SET LOCAL / COMMIT manually via `execute`, which takes `&self`.
-        // SET LOCAL applies for the duration of the surrounding transaction
-        // — by ending the transaction we restore the session default.
-        client.execute("BEGIN", &[]).await?;
-        let result = run_label_releases_with_timeout(
-            client, count_sql, fetch_sql, label_id, limit, offset,
-        )
-        .await;
-        match result {
-            Ok((count_row, rows)) => {
-                if let Err(e) = client.execute("COMMIT", &[]).await {
-                    return Err(e.into());
-                }
-                (count_row, rows)
-            }
-            Err(e) => {
-                let _ = client.execute("ROLLBACK", &[]).await;
-                return Err(e);
-            }
-        }
-    } else {
-        let count_row = client.query_one(count_sql, &[&label_id]).await?;
-        let rows = client.query(fetch_sql, &[&label_id, &limit, &offset]).await?;
-        (count_row, rows)
-    };
+    let count_row = client.query_one(count_sql, &[&label_id]).await?;
     let total: i64 = count_row.get("cnt");
+
+    let rows = client.query(fetch_sql, &[&label_id, &limit, &offset]).await?;
 
     let release_ids: Vec<i32> = rows.iter().map(|r| r.get("id")).collect();
     let (artist_map, label_map, format_map) = if release_ids.is_empty() {

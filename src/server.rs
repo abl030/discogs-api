@@ -266,18 +266,7 @@ async fn get_label_releases(
     ).await {
         Ok(Some(r)) => Ok(Json(r)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            // The recursive-CTE branch installs SET LOCAL statement_timeout
-            // and surfaces query_canceled as `LabelReleasesTimeout`. Map
-            // that to 503 so the caller can retry with include_sublabels=false
-            // instead of seeing a generic 500.
-            if e.downcast_ref::<db::LabelReleasesTimeout>().is_some() {
-                tracing::warn!("label releases timed out for id={id}: {e}");
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            tracing::error!("label releases query error: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(e) => { tracing::error!("label releases query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
     }
 }
 
