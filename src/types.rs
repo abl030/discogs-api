@@ -261,7 +261,7 @@ pub struct LabelSearchResponse {
 pub struct LabelHit {
     pub id: i32,
     pub name: String,
-    pub profile: String,
+    pub profile: Option<String>,
     pub parent_label_id: Option<i32>,
     pub parent_label_name: Option<String>,
     pub release_count: i64,
@@ -272,9 +272,9 @@ pub struct LabelHit {
 pub struct LabelDetail {
     pub id: i32,
     pub name: String,
-    pub profile: String,
-    pub contactinfo: String,
-    pub data_quality: String,
+    pub profile: Option<String>,
+    pub contactinfo: Option<String>,
+    pub data_quality: Option<String>,
     pub parent_label_id: Option<i32>,
     pub parent_label_name: Option<String>,
     pub total_releases: i64,

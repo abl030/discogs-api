@@ -949,11 +949,11 @@ pub async fn query_label_search(
     ).await?;
 
     let results = rows.iter().map(|r| {
-        let profile: String = r.get("profile");
+        let profile: Option<String> = r.get("profile");
         LabelHit {
             id: r.get("id"),
             name: r.get("name"),
-            profile: truncate_profile(&profile, 200),
+            profile: profile.map(|p| truncate_profile(&p, 200)),
             parent_label_id: r.get("parent_label_id"),
             parent_label_name: r.get("parent_label_name"),
             release_count: r.get("release_count"),
@@ -1033,9 +1033,12 @@ pub async fn query_label_releases(
 
     let (count_sql, fetch_sql) = if include_sublabels {
         (
+            // UNION (not UNION ALL): defends against parent_label_id cycles
+            // in the label tree. Discogs has no observed cycles in the dump,
+            // but a self-referencing parent_label_id would otherwise loop.
             "WITH RECURSIVE label_tree AS (
                  SELECT id FROM label WHERE id = $1
-                 UNION ALL
+                 UNION
                  SELECT l.id FROM label l
                  JOIN label_tree lt ON l.parent_label_id = lt.id
              )
@@ -1043,9 +1046,10 @@ pub async fn query_label_releases(
              FROM release r
              JOIN release_label rl ON rl.release_id = r.id
              WHERE rl.label_id IN (SELECT id FROM label_tree)",
+            // Same cycle guard as the count CTE above.
             "WITH RECURSIVE label_tree AS (
                  SELECT id FROM label WHERE id = $1
-                 UNION ALL
+                 UNION
                  SELECT l.id FROM label l
                  JOIN label_tree lt ON l.parent_label_id = lt.id
              ),
