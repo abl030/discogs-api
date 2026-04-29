@@ -245,6 +245,76 @@ pub struct Pagination {
     pub items: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Label endpoints — search, detail, releases
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelSearchResponse {
+    pub results: Vec<LabelHit>,
+    pub total: i64,
+    pub page: i32,
+    pub per_page: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelHit {
+    pub id: i32,
+    pub name: String,
+    pub profile: String,
+    pub parent_label_id: Option<i32>,
+    pub parent_label_name: Option<String>,
+    pub release_count: i64,
+    pub score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelDetail {
+    pub id: i32,
+    pub name: String,
+    pub profile: String,
+    pub contactinfo: String,
+    pub data_quality: String,
+    pub parent_label_id: Option<i32>,
+    pub parent_label_name: Option<String>,
+    pub total_releases: i64,
+    pub sub_labels: Vec<SubLabel>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubLabel {
+    pub id: i32,
+    pub name: String,
+    pub release_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelReleasesResponse {
+    pub results: Vec<LabelReleaseEntry>,
+    pub pagination: Pagination,
+    pub include_sublabels: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelReleaseEntry {
+    pub id: i32,
+    pub title: String,
+    pub country: String,
+    pub released: String,
+    pub master_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_first_released: Option<String>,
+    pub primary_type: String,
+    pub via_label_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_label_name: Option<String>,
+    pub artists: Vec<ApiArtistCredit>,
+    pub labels: Vec<ApiLabel>,
+    pub formats: Vec<ApiFormat>,
+}
+
 // Shared API sub-types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

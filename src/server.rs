@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/artists/{id}", get(get_artist))
         .route("/api/artists/{id}/releases", get(get_artist_releases))
         .route("/api/artists/{id}/masters", get(get_artist_masters))
+        .route("/api/labels", get(search_labels))
+        .route("/api/labels/{id}", get(get_label))
+        .route("/api/labels/{id}/releases", get(get_label_releases))
         // Discogs-API-compatible routes (for beets / python3-discogs-client)
         .route("/releases/{id}", get(discogs_get_release))
         .route("/masters/{id}", get(discogs_get_master))
@@ -195,6 +198,76 @@ async fn search_artists(
     ).await
         .map(Json)
         .map_err(|e| { tracing::error!("artist search error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })
+}
+
+// ---------------------------------------------------------------------------
+// Label handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LabelSearchParams {
+    name: Option<String>,
+    page: Option<i32>,
+    per_page: Option<i32>,
+}
+
+async fn search_labels(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LabelSearchParams>,
+) -> Result<Json<LabelSearchResponse>, StatusCode> {
+    let name = match params.name {
+        Some(ref n) if !n.is_empty() => n.as_str(),
+        _ => return Ok(Json(LabelSearchResponse {
+            results: vec![],
+            total: 0,
+            page: params.page.unwrap_or(1),
+            per_page: params.per_page.unwrap_or(25),
+        })),
+    };
+    db::query_label_search(
+        &state.client,
+        name,
+        params.page.unwrap_or(1),
+        params.per_page.unwrap_or(25),
+    ).await
+        .map(Json)
+        .map_err(|e| { tracing::error!("label search error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })
+}
+
+async fn get_label(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<LabelDetail>, StatusCode> {
+    match db::query_label(&state.client, id).await {
+        Ok(Some(l)) => Ok(Json(l)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { tracing::error!("label query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+    }
+}
+
+#[derive(Deserialize)]
+struct LabelReleasesParams {
+    page: Option<i32>,
+    per_page: Option<i32>,
+    include_sublabels: Option<bool>,
+}
+
+async fn get_label_releases(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Query(params): Query<LabelReleasesParams>,
+) -> Result<Json<LabelReleasesResponse>, StatusCode> {
+    match db::query_label_releases(
+        &state.client,
+        id,
+        params.page.unwrap_or(1),
+        params.per_page.unwrap_or(100),
+        params.include_sublabels.unwrap_or(true),
+    ).await {
+        Ok(Some(r)) => Ok(Json(r)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { tracing::error!("label releases query error: {e}"); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+    }
 }
 
 // ---------------------------------------------------------------------------

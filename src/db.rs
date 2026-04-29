@@ -910,6 +910,236 @@ pub async fn query_artist_masters(
     Ok(Some(ArtistMastersResponse { results, total, page, per_page }))
 }
 
+// ---------------------------------------------------------------------------
+// Label endpoints
+// ---------------------------------------------------------------------------
+
+pub async fn query_label_search(
+    client: &Client,
+    name: &str,
+    page: i32,
+    per_page: i32,
+) -> anyhow::Result<LabelSearchResponse> {
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let limit = per_page as i64;
+    let offset = (page as i64 - 1) * limit;
+
+    let count_row = client.query_one(
+        "SELECT count(*) AS cnt FROM label
+         WHERE to_tsvector('english', name) @@ plainto_tsquery('english', $1)",
+        &[&name],
+    ).await?;
+    let total: i64 = count_row.get("cnt");
+
+    // Single query: FTS-match labels, count releases via LEFT JOIN, denormalize parent name.
+    let rows = client.query(
+        "SELECT l.id, l.name, l.profile, l.parent_label_id, p.name AS parent_label_name,
+                COUNT(rl.release_id) AS release_count,
+                ts_rank(to_tsvector('english', l.name), plainto_tsquery('english', $1)) AS score,
+                (lower(l.name) = lower($1)) AS exact_match
+         FROM label l
+         LEFT JOIN label p ON p.id = l.parent_label_id
+         LEFT JOIN release_label rl ON rl.label_id = l.id
+         WHERE to_tsvector('english', l.name) @@ plainto_tsquery('english', $1)
+         GROUP BY l.id, l.name, l.profile, l.parent_label_id, p.name
+         ORDER BY exact_match DESC, score DESC, length(l.name), l.id
+         LIMIT $2 OFFSET $3",
+        &[&name, &limit, &offset],
+    ).await?;
+
+    let results = rows.iter().map(|r| {
+        let profile: String = r.get("profile");
+        LabelHit {
+            id: r.get("id"),
+            name: r.get("name"),
+            profile: truncate_profile(&profile, 200),
+            parent_label_id: r.get("parent_label_id"),
+            parent_label_name: r.get("parent_label_name"),
+            release_count: r.get("release_count"),
+            score: r.get::<_, f32>("score"),
+        }
+    }).collect();
+
+    Ok(LabelSearchResponse { results, total, page, per_page })
+}
+
+pub async fn query_label(client: &Client, id: i32) -> anyhow::Result<Option<LabelDetail>> {
+    let row = match client.query_opt(
+        "SELECT l.id, l.name, l.profile, l.contactinfo, l.data_quality,
+                l.parent_label_id, p.name AS parent_label_name
+         FROM label l
+         LEFT JOIN label p ON p.id = l.parent_label_id
+         WHERE l.id = $1",
+        &[&id],
+    ).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let total_row = client.query_one(
+        "SELECT count(*) AS cnt FROM release_label WHERE label_id = $1",
+        &[&id],
+    ).await?;
+    let total_releases: i64 = total_row.get("cnt");
+
+    let sub_rows = client.query(
+        "SELECT l.id, l.name, COUNT(rl.release_id) AS release_count
+         FROM label l
+         LEFT JOIN release_label rl ON rl.label_id = l.id
+         WHERE l.parent_label_id = $1
+         GROUP BY l.id, l.name
+         ORDER BY l.name, l.id",
+        &[&id],
+    ).await?;
+    let sub_labels: Vec<SubLabel> = sub_rows.iter().map(|r| SubLabel {
+        id: r.get("id"),
+        name: r.get("name"),
+        release_count: r.get("release_count"),
+    }).collect();
+
+    Ok(Some(LabelDetail {
+        id: row.get("id"),
+        name: row.get("name"),
+        profile: row.get("profile"),
+        contactinfo: row.get("contactinfo"),
+        data_quality: row.get("data_quality"),
+        parent_label_id: row.get("parent_label_id"),
+        parent_label_name: row.get("parent_label_name"),
+        total_releases,
+        sub_labels,
+    }))
+}
+
+pub async fn query_label_releases(
+    client: &Client,
+    label_id: i32,
+    page: i32,
+    per_page: i32,
+    include_sublabels: bool,
+) -> anyhow::Result<Option<LabelReleasesResponse>> {
+    // Existence check
+    let exists = client.query_opt(
+        "SELECT 1 FROM label WHERE id = $1", &[&label_id],
+    ).await?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let limit = per_page as i64;
+    let offset = (page as i64 - 1) * limit;
+
+    let (count_sql, fetch_sql) = if include_sublabels {
+        (
+            "WITH RECURSIVE label_tree AS (
+                 SELECT id FROM label WHERE id = $1
+                 UNION ALL
+                 SELECT l.id FROM label l
+                 JOIN label_tree lt ON l.parent_label_id = lt.id
+             )
+             SELECT count(DISTINCT r.id) AS cnt
+             FROM release r
+             JOIN release_label rl ON rl.release_id = r.id
+             WHERE rl.label_id IN (SELECT id FROM label_tree)",
+            "WITH RECURSIVE label_tree AS (
+                 SELECT id FROM label WHERE id = $1
+                 UNION ALL
+                 SELECT l.id FROM label l
+                 JOIN label_tree lt ON l.parent_label_id = lt.id
+             ),
+             matched AS (
+                 SELECT DISTINCT ON (r.id)
+                        r.id, r.title, r.country, r.released, r.master_id,
+                        rl.label_id AS via_label_id
+                 FROM release r
+                 JOIN release_label rl ON rl.release_id = r.id
+                 WHERE rl.label_id IN (SELECT id FROM label_tree)
+                 ORDER BY r.id, (rl.label_id = $1) DESC, rl.label_id
+             )
+             SELECT mt.id, mt.title, mt.country, mt.released, mt.master_id,
+                    mt.via_label_id,
+                    m.title AS master_title,
+                    (SELECT MIN(r2.released) FROM release r2
+                       WHERE r2.master_id = mt.master_id AND r2.released <> '') AS master_first_released,
+                    CASE WHEN mt.via_label_id = $1 THEN NULL
+                         ELSE l_via.name END AS sub_label_name
+             FROM matched mt
+             LEFT JOIN master m ON m.id = mt.master_id
+             LEFT JOIN label l_via ON l_via.id = mt.via_label_id
+             ORDER BY mt.released, mt.id
+             LIMIT $2 OFFSET $3",
+        )
+    } else {
+        (
+            "SELECT count(DISTINCT r.id) AS cnt
+             FROM release r
+             JOIN release_label rl ON rl.release_id = r.id
+             WHERE rl.label_id = $1",
+            "SELECT DISTINCT ON (r.id)
+                    r.id, r.title, r.country, r.released, r.master_id,
+                    $1::int AS via_label_id,
+                    m.title AS master_title,
+                    (SELECT MIN(r2.released) FROM release r2
+                       WHERE r2.master_id = r.master_id AND r2.released <> '') AS master_first_released,
+                    NULL::text AS sub_label_name
+             FROM release r
+             JOIN release_label rl ON rl.release_id = r.id
+             LEFT JOIN master m ON m.id = r.master_id
+             WHERE rl.label_id = $1
+             ORDER BY r.id, r.released, r.id
+             LIMIT $2 OFFSET $3",
+        )
+    };
+
+    let count_row = client.query_one(count_sql, &[&label_id]).await?;
+    let total: i64 = count_row.get("cnt");
+
+    let rows = client.query(fetch_sql, &[&label_id, &limit, &offset]).await?;
+
+    let release_ids: Vec<i32> = rows.iter().map(|r| r.get("id")).collect();
+    let (artist_map, label_map, format_map) = if release_ids.is_empty() {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    } else {
+        fetch_release_enrichments(client, &release_ids).await?
+    };
+
+    let results = rows.iter().map(|r| {
+        let id: i32 = r.get("id");
+        let formats = format_map.get(&id).cloned().unwrap_or_default();
+        let descs: Vec<String> = formats.iter().map(|f| f.descriptions.clone()).collect();
+        let primary_type = infer_primary_type(&descs);
+        LabelReleaseEntry {
+            id,
+            title: r.get("title"),
+            country: r.get("country"),
+            released: r.get("released"),
+            master_id: r.get("master_id"),
+            master_title: r.get("master_title"),
+            master_first_released: r.get("master_first_released"),
+            primary_type,
+            via_label_id: r.get("via_label_id"),
+            sub_label_name: r.get("sub_label_name"),
+            artists: artist_map.get(&id).cloned().unwrap_or_default(),
+            labels: label_map.get(&id).cloned().unwrap_or_default(),
+            formats,
+        }
+    }).collect();
+
+    let pages = if per_page > 0 {
+        ((total as f64) / (per_page as f64)).ceil() as i32
+    } else {
+        1
+    };
+
+    Ok(Some(LabelReleasesResponse {
+        results,
+        pagination: Pagination { page, per_page, pages, items: total },
+        include_sublabels,
+    }))
+}
+
 // Fetch release_format.descriptions rows grouped by release_id.
 // Returns vec<description-string> per release in insertion order.
 async fn fetch_format_descriptions(

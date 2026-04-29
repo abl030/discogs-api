@@ -162,6 +162,7 @@ CREATE INDEX idx_master_main_release ON master (main_release_id);
 
 CREATE INDEX idx_release_title_fts ON release USING GIN (to_tsvector('english', title));
 CREATE INDEX idx_artist_name_fts ON artist USING GIN (to_tsvector('english', name));
+CREATE INDEX idx_label_name_fts ON label USING GIN (to_tsvector('english', name));
 CREATE INDEX idx_release_search_text_fts ON release USING GIN (to_tsvector('english', search_text));
 ";
 
