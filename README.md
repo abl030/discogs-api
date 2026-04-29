@@ -26,6 +26,15 @@ Data source: ~11 GB compressed XML across 4 files (artists, labels, masters, rel
 | GET | `/api/releases/{id}` | Full release detail: tracks, genres, styles, identifiers |
 | GET | `/api/masters/{id}` | Master release with all child releases |
 | GET | `/api/artists/{id}` | Artist profile, aliases, name variations |
+| GET | `/api/artists/{id}/releases?page=1&per_page=100` | Paginated releases for an artist |
+| GET | `/api/labels?name=X&page=1&per_page=25` | Label search with release counts and parent-label context |
+| GET | `/api/labels/{id}` | Label profile, parent, and direct sub-labels |
+| GET | `/api/labels/{id}/releases?page=1&per_page=100&include_sublabels=true` | Paginated label releases, optionally including recursive sub-labels |
+
+Label release rows include both `label_id` and legacy `via_label_id` during the
+rollout window. Recursive sub-label rollups use a 15 second PostgreSQL
+`statement_timeout`; timeout and pool-saturation failures return HTTP 503 with
+`{"error":"timeout","label_id":...}` or `{"error":"pool_unavailable","label_id":...}`.
 
 ### Examples
 

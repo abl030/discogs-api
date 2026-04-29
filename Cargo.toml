@@ -16,6 +16,7 @@ anyhow = "1"
 axum = "0.8"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+deadpool-postgres = "0.14.1"
 flate2 = "1"
 futures-util = "0.3"
 quick-xml = { version = "0.37", features = ["serialize"] }

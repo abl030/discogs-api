@@ -261,7 +261,7 @@ pub struct LabelSearchResponse {
 pub struct LabelHit {
     pub id: i32,
     pub name: String,
-    pub profile: Option<String>,
+    pub profile: String,
     pub parent_label_id: Option<i32>,
     pub parent_label_name: Option<String>,
     pub release_count: i64,
@@ -272,9 +272,9 @@ pub struct LabelHit {
 pub struct LabelDetail {
     pub id: i32,
     pub name: String,
-    pub profile: Option<String>,
-    pub contactinfo: Option<String>,
-    pub data_quality: Option<String>,
+    pub profile: String,
+    pub contactinfo: String,
+    pub data_quality: String,
     pub parent_label_id: Option<i32>,
     pub parent_label_name: Option<String>,
     pub total_releases: i64,
@@ -307,6 +307,7 @@ pub struct LabelReleaseEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master_first_released: Option<String>,
     pub primary_type: String,
+    pub label_id: i32,
     pub via_label_id: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_label_name: Option<String>,
@@ -437,4 +438,33 @@ pub struct DiscogsSearchResult {
     #[serde(rename = "type")]
     pub type_: String,
     pub title: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_release_entry_serializes_additive_label_id_fields() {
+        let entry = LabelReleaseEntry {
+            id: 83182,
+            title: "OK Computer".to_string(),
+            country: "Europe".to_string(),
+            released: "1997-06-16".to_string(),
+            master_id: Some(21491),
+            master_title: Some("OK Computer".to_string()),
+            master_first_released: Some("1997".to_string()),
+            primary_type: "Album".to_string(),
+            label_id: 2294,
+            via_label_id: 2294,
+            sub_label_name: None,
+            artists: vec![],
+            labels: vec![],
+            formats: vec![],
+        };
+
+        let value = serde_json::to_value(entry).expect("serialize label release entry");
+        assert_eq!(value["label_id"], 2294);
+        assert_eq!(value["via_label_id"], 2294);
+    }
 }

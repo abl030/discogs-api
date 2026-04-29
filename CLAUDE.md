@@ -70,4 +70,10 @@ ssh doc2 'psql -h 192.168.100.13 -U discogs -d discogs -c "SELECT count(*) FROM 
 - **Channel pipeline**: XML parsing runs on a blocking thread, sends 10K-entity batches through `mpsc` to async COPY. Backpressure via channel capacity of 4.
 - **Atomic downloads**: Files written to `.partial`, renamed on success. Prevents truncated files from being treated as complete.
 - **Full replacement**: Every import drops and recreates all tables. No incremental updates. Indexes built post-import for speed.
-- **Single PG connection**: The API server uses one `tokio_postgres::Client` (multiplexed). No pool needed for this traffic level.
+- **API Postgres pool**: The API server uses a `deadpool-postgres` pool
+  (max size 16, bounded wait/create/recycle timeouts), while the importer still uses one dedicated
+  `tokio_postgres::Client` for COPY. Do not add transaction-scoped session
+  state such as `SET LOCAL statement_timeout` on a shared multiplexed client;
+  use a pool-acquired connection so timeout and aborted-transaction state stay
+  scoped to one request. See
+  `cratedigger/docs/plans/2026-04-29-002-fix-discogs-api-connection-pool-plan.md`.
