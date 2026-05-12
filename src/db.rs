@@ -1158,15 +1158,21 @@ pub async fn query_artist_masters(
     let limit = per_page as i64;
     let offset = (page as i64 - 1) * limit;
 
+    // The Discogs dump uses `master_id = 0` as the masterless sentinel
+    // (not NULL). Normalise both 0 and NULL to "no master" here so the
+    // count agrees with the projection — see the `NULLIF(r.master_id, 0)`
+    // alias in the data CTE below. Without this, an artist whose releases
+    // are all masterless reports `total > 0` but yields an empty result
+    // set (count(DISTINCT 0) = 1, but `master` has no id=0 row).
     let count_row = client
         .query_one(
             "SELECT
            (SELECT count(DISTINCT r.master_id) FROM release r
               JOIN release_artist ra ON ra.release_id = r.id
-              WHERE ra.artist_id = $1 AND r.master_id IS NOT NULL)
+              WHERE ra.artist_id = $1 AND r.master_id IS NOT NULL AND r.master_id <> 0)
          + (SELECT count(*) FROM release r
               JOIN release_artist ra ON ra.release_id = r.id
-              WHERE ra.artist_id = $1 AND r.master_id IS NULL)
+              WHERE ra.artist_id = $1 AND (r.master_id IS NULL OR r.master_id = 0))
          AS total",
             &[&artist_id],
         )
@@ -1175,7 +1181,8 @@ pub async fn query_artist_masters(
 
     let rows = client.query(
         "WITH ar AS (
-             SELECT r.id, r.title, r.master_id, NULLIF(r.released, '') AS released
+             SELECT r.id, r.title, NULLIF(r.master_id, 0) AS master_id,
+                    NULLIF(r.released, '') AS released
              FROM release r
              JOIN release_artist ra ON ra.release_id = r.id
              WHERE ra.artist_id = $1
