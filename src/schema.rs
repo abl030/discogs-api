@@ -151,6 +151,7 @@ CREATE INDEX idx_release_label_label_id ON release_label (label_id);
 CREATE INDEX idx_release_format_release_id ON release_format (release_id);
 CREATE INDEX idx_release_track_release_id ON release_track (release_id);
 CREATE INDEX idx_release_track_artist_release_id ON release_track_artist (release_id);
+CREATE INDEX idx_release_track_artist_artist_id ON release_track_artist (artist_id);
 CREATE INDEX idx_release_genre_release_id ON release_genre (release_id);
 CREATE INDEX idx_release_style_release_id ON release_style (release_id);
 CREATE INDEX idx_release_identifier_release_id ON release_identifier (release_id);

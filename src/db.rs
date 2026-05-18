@@ -1299,6 +1299,155 @@ pub async fn query_artist_masters(
     }))
 }
 
+/// Releases where the artist appears via a track-level credit only —
+/// compilation appearances, guest spots, sampler tracks — i.e. rows
+/// that ``query_artist_masters`` does NOT return because the artist
+/// isn't in the master/release-level credits.
+///
+/// Same enrichment + response shape as the masters endpoint so the
+/// frontend can render both lists identically. No LIMIT/OFFSET; for
+/// prolific session musicians callers may need to budget render time
+/// rather than expect a paged window.
+///
+/// SQL strategy: anchor on ``release_track_artist`` (indexed by
+/// ``artist_id``), anti-join against ``release_artist`` to drop rows
+/// already counted as primary, then collapse by master_id like the
+/// masters endpoint does.
+pub async fn query_artist_appearances(
+    pool: &Pool,
+    artist_id: i32,
+) -> anyhow::Result<Option<ArtistMastersResponse>> {
+    let client = get_client(pool).await?;
+    let client = &**client;
+
+    let exists = client
+        .query_opt("SELECT 1 FROM artist WHERE id = $1", &[&artist_id])
+        .await?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+
+    let rows = client.query(
+        "WITH ar AS (
+             SELECT DISTINCT r.id, r.title, NULLIF(r.master_id, 0) AS master_id,
+                    NULLIF(r.released, '') AS released
+             FROM release r
+             JOIN release_track_artist rta
+               ON rta.release_id = r.id AND rta.artist_id = $1
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM release_artist ra
+                 WHERE ra.release_id = r.id AND ra.artist_id = $1
+             )
+         ),
+         combined AS (
+             SELECT 'master'::text AS kind,
+                    m.id AS entry_id,
+                    m.title AS title,
+                    COALESCE(
+                        m.main_release_id,
+                        (SELECT ar2.id FROM ar ar2 WHERE ar2.master_id = m.id
+                         ORDER BY ar2.released NULLS LAST, ar2.id LIMIT 1)
+                    ) AS rep_release_id,
+                    (SELECT MIN(ar2.released) FROM ar ar2 WHERE ar2.master_id = m.id) AS first_release_date
+             FROM master m
+             WHERE EXISTS (SELECT 1 FROM ar WHERE ar.master_id = m.id)
+             UNION ALL
+             SELECT 'release'::text AS kind,
+                    ar.id AS entry_id,
+                    ar.title AS title,
+                    ar.id AS rep_release_id,
+                    ar.released AS first_release_date
+             FROM ar
+             WHERE ar.master_id IS NULL
+         )
+         SELECT kind, entry_id, title, rep_release_id,
+                COALESCE(first_release_date, '') AS released_date
+         FROM combined
+         ORDER BY first_release_date NULLS LAST, entry_id",
+        &[&artist_id],
+    ).await?;
+
+    let mut rep_release_ids: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut master_ids: Vec<i32> = Vec::new();
+    let mut masterless_release_ids: Vec<i32> = Vec::new();
+    for r in &rows {
+        let rep: i32 = r.get("rep_release_id");
+        rep_release_ids.push(rep);
+        let kind: String = r.get("kind");
+        let entry_id: i32 = r.get("entry_id");
+        if kind == "master" {
+            master_ids.push(entry_id);
+        } else {
+            masterless_release_ids.push(entry_id);
+        }
+    }
+
+    let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
+    let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
+    let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
+
+    let results: Vec<ArtistMasterEntry> = rows
+        .iter()
+        .map(|r| {
+            let kind: String = r.get("kind");
+            let entry_id: i32 = r.get("entry_id");
+            let title: String = r.get("title");
+            let rep: i32 = r.get("rep_release_id");
+            let first_release_date: String = r.get("released_date");
+
+            let descriptions = fmt_map.get(&rep).cloned().unwrap_or_default();
+            let primary_type = infer_primary_type(&descriptions);
+
+            let (credit_str, primary_artist) = if kind == "master" {
+                let pairs = master_credit_map
+                    .get(&entry_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let primary = pairs.first().map(|&(_, _, id)| id);
+                let name_join: Vec<(String, String)> =
+                    pairs.into_iter().map(|(n, j, _)| (n, j)).collect();
+                (join_artist_credit(&name_join), primary)
+            } else {
+                let pairs = release_credit_map
+                    .get(&entry_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let primary = pairs.first().map(|&(_, _, id)| id);
+                let name_join: Vec<(String, String)> =
+                    pairs.into_iter().map(|(n, j, _)| (n, j)).collect();
+                (join_artist_credit(&name_join), primary)
+            };
+
+            let (id_value, is_masterless) = if kind == "master" {
+                (MasterEntryId::Master(entry_id), false)
+            } else {
+                (
+                    MasterEntryId::Release(format!("release-{}", entry_id)),
+                    true,
+                )
+            };
+
+            ArtistMasterEntry {
+                id: id_value,
+                title,
+                type_: primary_type,
+                first_release_date,
+                artist_credit: credit_str,
+                primary_artist_id: primary_artist,
+                is_masterless,
+            }
+        })
+        .collect();
+
+    let total = results.len() as i64;
+    Ok(Some(ArtistMastersResponse {
+        results,
+        total,
+        page: 1,
+        per_page: total.max(1) as i32,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Label endpoints
 // ---------------------------------------------------------------------------
