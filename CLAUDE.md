@@ -35,8 +35,8 @@ Tests cover the XML parsers (4 tests in `src/xml.rs`). No integration tests — 
 
 Pure application code — no infrastructure awareness. Takes `--dsn` and `--dump-dir` / `--port` as CLI args.
 
-- **Postgres**: nspawn container `discogs-db` on doc2, hostNum=6 (192.168.100.13:5432)
-- **DSN**: `postgresql://discogs@192.168.100.13:5432/discogs`
+- **Postgres**: nspawn container `discogs-db` on doc2, reachable at `10.20.0.13:5432` (the live nspawn-bridge address the service connects over; `machinectl list` confirms it). The host-namespace address `192.168.100.13` times out.
+- **DSN**: `postgresql://discogs@10.20.0.13:5432/discogs`
 - **API**: `discogs.ablz.au` (port 8086, behind localProxy with auto ACME)
 - **Data**: `/mnt/mirrors/discogs` on doc2 (re-downloadable, not backed up)
 - **NixOS module**: `nixosconfig/modules/nixos/services/discogs.nix`
@@ -44,15 +44,28 @@ Pure application code — no infrastructure awareness. Takes `--dsn` and `--dump
 
 ## Deploying
 
-Deploy from proxmox-vm (where this repo lives):
+Deploy from proxmox-vm/doc1 (where this repo lives, and which holds the Forgejo
+token + SSH signing key).
+
+**Since the 2026-06-10 Forgejo cutover, the nixosconfig leg goes through Forgejo
+(`git.ablz.au`) + `fleet-update`, NOT `github:abl030/nixosconfig`.** GitHub's
+nixosconfig is a frozen, stale fallback. This repo itself still pushes to GitHub;
+only the nixosconfig leg changed.
 
 ```bash
-git push
-cd ~/nixosconfig && nix flake update discogs-src && git add flake.lock && git commit -m "discogs: description" && git push
-ssh doc2 'sudo nixos-rebuild switch --flake github:abl030/nixosconfig#doc2 --refresh'
+git push                                          # this repo → GitHub (unchanged)
+cd ~/nixosconfig && git pull && nix flake update discogs-src && git add flake.lock \
+  && git commit -m "discogs: description"         # commit must be SSH-signed (commit.gpgsign is on)
+TOKEN=$(cat /run/secrets/forgejo/nixbot-token) \
+  && git -c "http.extraHeader=Authorization: token ${TOKEN}" push origin master   # never echo the token
+ssh doc2 'sudo fleet-update'                       # verifies signatures, builds from its own clone
 ```
 
-The API service restarts automatically. The import does NOT restart (timer-triggered oneshot).
+`fleet-update` verifies every commit in range is SSH-signed by a key in
+hosts.nix, then builds from its own root-owned clone. The `discogs-api` service
+restarts automatically on switch. The import does NOT restart (timer-triggered
+oneshot). Do NOT deploy with `nixos-rebuild switch --flake github:...` — GitHub
+nixosconfig is stale.
 
 ## Debugging on doc2
 
@@ -61,7 +74,10 @@ ssh doc2 'systemctl status discogs-api.service'
 ssh doc2 'journalctl -u discogs-api.service -f'
 ssh doc2 'journalctl -u discogs-import.service -f'
 ssh doc2 'curl -s http://127.0.0.1:8086/health'
-ssh doc2 'psql -h 192.168.100.13 -U discogs -d discogs -c "SELECT count(*) FROM release"'
+# The DB nspawn is reachable at 10.20.0.13 (NOT 192.168.100.13, which times out
+# from doc2's host namespace — `machinectl list` shows the live address). The
+# password lives in /run/secrets/discogs-pgpass in POSTGRES_PASSWORD=... format.
+ssh doc2 'export PGPASSWORD=$(sudo cat /run/secrets/discogs-pgpass | grep -oP "POSTGRES_PASSWORD=\K.*"); psql -h 10.20.0.13 -U discogs -d discogs -c "SELECT count(*) FROM release"'
 ```
 
 ## Key Design Decisions
