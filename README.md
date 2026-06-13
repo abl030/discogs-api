@@ -22,7 +22,7 @@ Data source: ~11 GB compressed XML across 4 files (artists, labels, masters, rel
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service status, release count, last import timestamp |
-| GET | `/api/search?artist=X&title=Y&page=1&per_page=25` | Full-text search across releases, enriched with artists/labels/formats |
+| GET | `/api/search?artist=X&title=Y&artist_id=N&page=1&per_page=25` | Full-text search across releases, enriched with artists/labels/formats. `artist_id` is an exact structural filter (release credited to that artist id) — use it instead of the free-text `artist` term when you have a canonical id, e.g. Various Artists (`artist_id=194`), whose name row is absent from the dump and so can never match the text index |
 | GET | `/api/releases/{id}` | Full release detail: tracks, genres, styles, identifiers |
 | GET | `/api/masters/{id}` | Master release with all child releases |
 | GET | `/api/artists/{id}` | Artist profile, aliases, name variations |
@@ -48,6 +48,9 @@ curl 'https://discogs.ablz.au/api/search?artist=Radiohead&title=OK+Computer'
 
 # Search by title only
 curl 'https://discogs.ablz.au/api/search?title=Blue+Train&per_page=5'
+
+# Various Artists compilations matching a title (artist_id=194 is the dump's VA id)
+curl 'https://discogs.ablz.au/api/search?title=Rock+Christmas&artist_id=194'
 
 # Get a specific release with full tracklist
 curl https://discogs.ablz.au/api/releases/83182

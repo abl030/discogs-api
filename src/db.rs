@@ -613,6 +613,7 @@ pub async fn query_search(
     pool: &Pool,
     title: Option<&str>,
     artist: Option<&str>,
+    artist_id: Option<i32>,
     page: i32,
     per_page: i32,
 ) -> anyhow::Result<SearchResponse> {
@@ -624,7 +625,7 @@ pub async fn query_search(
     let limit = per_page as i64;
     let offset = (page as i64 - 1) * limit;
 
-    if title.is_none() && artist.is_none() {
+    if title.is_none() && artist.is_none() && artist_id.is_none() {
         return Ok(SearchResponse {
             results: vec![],
             page,
@@ -655,8 +656,11 @@ pub async fn query_search(
                 JOIN artist a ON ra.artist_id = a.id
                 WHERE ra.release_id = r.id
                 AND to_tsvector('english', a.name) @@ plainto_tsquery('english', $2)))
+           AND ($6::int IS NULL OR EXISTS (
+                SELECT 1 FROM release_artist rai
+                WHERE rai.release_id = r.id AND rai.artist_id = $6))
          ORDER BY score DESC, r.id LIMIT $3 OFFSET $4",
-        &[&title, &artist, &limit, &offset, &score_q],
+        &[&title, &artist, &limit, &offset, &score_q, &artist_id],
     ).await?;
 
     let release_ids: Vec<i32> = rows.iter().map(|r| r.get("id")).collect();

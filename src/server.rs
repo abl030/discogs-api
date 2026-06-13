@@ -75,6 +75,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRespons
 #[derive(Deserialize)]
 struct SearchParams {
     artist: Option<String>,
+    artist_id: Option<i32>,
     title: Option<String>,
     page: Option<i32>,
     per_page: Option<i32>,
@@ -95,6 +96,7 @@ async fn search(
         &state.pool,
         params.title.as_deref(),
         params.artist.as_deref(),
+        params.artist_id,
         params.page.unwrap_or(1),
         params.per_page.unwrap_or(25),
     )
