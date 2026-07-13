@@ -57,6 +57,39 @@ truncating the catalogue. The bulk response uses the same
 `ArtistMastersResponse` fields (`results`, `total`, `page`, `per_page`) and the
 same `ArtistMasterEntry` row shape as the paginated route.
 
+### Artist catalogue wire contract
+
+`/masters`, `/masters/all`, and `/appearances` intentionally share one strict
+row shape. This is a cross-repository contract with Cratedigger, not an
+incidental serialization detail:
+
+| Field | Wire meaning |
+|-------|--------------|
+| `id` | Integer Discogs master ID, or the string `release-<id>` for a masterless release. The namespace prefix prevents a numeric master/release ID collision. |
+| `title` | Master title, or exact release title for a masterless row. |
+| `type` | Legacy scalar type inferred from the representative release. Kept for existing consumers. |
+| `primary_types` | Required, sorted, deduplicated structural set containing only `Album`, `EP`, and/or `Single`. For masters it covers every child pressing; for masterless rows it covers that exact release. |
+| `first_release_date` | Earliest non-blank represented release date, or `""` when unknown. |
+| `artist_credit` | Master/release-level credit string, or `""` when that credit does not exist. |
+| `primary_artist_id` | Integer artist ID or JSON `null`. `null` is valid for an appearance master that has track-level evidence but no master-level credit. |
+| `is_masterless` | `true` only for `release-<id>` rows. |
+
+Discogs dump rows with `master_id IS NULL` and the legacy `master_id = 0`
+sentinel are both masterless. Format qualifiers such as `Compilation`, `Promo`,
+and `Unofficial Release` are not structural types; a recognized structural token
+beside a qualifier still counts. A compilation-only row therefore has
+`primary_types: []`.
+
+The executable producer contract lives in `tests/artist_masters_sql.rs`. It
+starts a real ephemeral PostgreSQL instance and pins masters, masterless rows,
+track-credit appearances, both empty-array query namespaces, `master_id = 0`,
+qualifier handling, numeric ID collisions, and nullable credits. The exact
+nullable handoff fixture is the appearance master titled `Mixed appearance
+master`, whose `primary_artist_id` is `null`. Cratedigger consumes that same
+fixture in `tests/test_discogs_api.py`, normalizes the nullable ID to `""`, and
+rejects missing or wrongly typed required fields at its `msgspec` boundary.
+Change either side only as a coordinated cross-repository contract update.
+
 ### Examples
 
 ```bash
@@ -81,6 +114,10 @@ curl https://discogs.ablz.au/api/masters/21491
 
 # Get artist profile
 curl https://discogs.ablz.au/api/artists/3840
+
+# Complete primary-credit catalogue and track-credit appearances
+curl https://discogs.ablz.au/api/artists/3840/masters/all
+curl https://discogs.ablz.au/api/artists/3840/appearances
 ```
 
 ### Search
@@ -164,24 +201,32 @@ homelab.services.discogs = {
 };
 ```
 
-### Manual deploy cycle
+### Deploy cycle
 
 ```bash
-# 1. Push code changes
+# 1. Push this repository to GitHub
 git push
 
-# 2. Update flake lock in nixosconfig
+# 2. On doc1, update the Forgejo-backed nixosconfig checkout
 cd ~/nixosconfig
 nix flake update discogs-src
-git add flake.lock && git commit -m "discogs: <description>" && git push
+git add flake.lock
+git commit -m "discogs: <description>"  # commit must be SSH-signed
+TOKEN=$(cat /run/secrets/forgejo/nixbot-token)
+git -c "http.extraHeader=Authorization: token ${TOKEN}" push origin master
+unset TOKEN
 
-# 3. Rebuild on target host
-ssh doc2 'sudo nixos-rebuild switch --flake github:abl030/nixosconfig#doc2 --refresh'
+# 3. Trigger doc2's locked, signature-verifying sibling deploy
+fleet-deploy doc2
 
 # 4. (First time only) Run initial import
 ssh doc2 'sudo systemctl start discogs-import'
 ssh doc2 'journalctl -u discogs-import -f'  # watch progress
 ```
+
+Forgejo is the nixosconfig write and verified-deploy root. Do not deploy this
+service with a direct `nixos-rebuild --flake github:...` or by SSHing to doc2 to
+run `fleet-update`; from doc1, `fleet-deploy doc2` is the normal sibling path.
 
 ## Deploying without NixOS
 

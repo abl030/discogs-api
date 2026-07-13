@@ -60,14 +60,16 @@ cd ~/nixosconfig && git pull && nix flake update discogs-src && git add flake.lo
   && git commit -m "discogs: description"         # commit must be SSH-signed (commit.gpgsign is on)
 TOKEN=$(cat /run/secrets/forgejo/nixbot-token) \
   && git -c "http.extraHeader=Authorization: token ${TOKEN}" push origin master   # never echo the token
-ssh doc2 'sudo fleet-update'                       # verifies signatures, builds from its own clone
+unset TOKEN
+fleet-deploy doc2                                  # locked sibling trigger; target verifies signatures
 ```
 
-`fleet-update` verifies every commit in range is SSH-signed by a key in
-hosts.nix, then builds from its own root-owned clone. The `discogs-api` service
+`fleet-deploy doc2` starts the target's verified `nixos-upgrade` path; its
+internal `fleet-update` verifies every commit in range against the allowed
+signers before building from the root-owned clone. The `discogs-api` service
 restarts automatically on switch. The import does NOT restart (timer-triggered
-oneshot). Do NOT deploy with `nixos-rebuild switch --flake github:...` — GitHub
-nixosconfig is stale.
+oneshot). Do NOT deploy with `nixos-rebuild switch --flake github:...` or by
+SSHing to doc2 to invoke `fleet-update` directly.
 
 ## Debugging on doc2
 

@@ -223,7 +223,7 @@ All under `/mnt/mirrors/` — re-downloadable, NOT backed up. Same tier as MB mi
 ssh doc2 'systemctl is-active container@discogs-db.service'
 
 # Row count after import
-ssh doc2 'psql -h 192.168.100.13 -U discogs -d discogs -c "SELECT count(*) FROM release"'
+ssh doc2 'export PGPASSWORD=$(sudo cat /run/secrets/discogs-pgpass | grep -oP "POSTGRES_PASSWORD=\K.*"); psql -h 10.20.0.13 -U discogs -d discogs -c "SELECT count(*) FROM release"'
 
 # API health
 curl https://discogs.ablz.au/health
