@@ -43,7 +43,10 @@ include `primary_types`, a sorted, deduplicated list of recognized structural
 types (`Album`, `EP`, `Single`). For a master this list aggregates format
 descriptions across every child pressing; for a masterless entry it reflects
 only that exact release. An empty list means the available Discogs descriptions
-do not identify a recognized structural type.
+do not identify a recognized structural type. `Compilation` is treated as a
+qualifier rather than structural type evidence, so a compilation-only entry is
+unknown; literal `Album`, `EP`, or `Single` descriptions still count when they
+appear alongside it.
 
 ### Examples
 
