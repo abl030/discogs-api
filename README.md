@@ -27,6 +27,8 @@ Data source: ~11 GB compressed XML across 4 files (artists, labels, masters, rel
 | GET | `/api/masters/{id}` | Master release with all child releases |
 | GET | `/api/artists/{id}` | Artist profile, aliases, name variations |
 | GET | `/api/artists/{id}/releases?page=1&per_page=100` | Paginated releases for an artist |
+| GET | `/api/artists/{id}/masters?page=1&per_page=100` | Paginated master and masterless discography entries for an artist |
+| GET | `/api/artists/{id}/appearances` | Releases where an artist has track-level credits but no release-level credit |
 | GET | `/api/labels?name=X&page=1&per_page=25` | Label search with release counts and parent-label context |
 | GET | `/api/labels/{id}` | Label profile, parent, and direct sub-labels |
 | GET | `/api/labels/{id}/releases?page=1&per_page=100&include_sublabels=true` | Paginated label releases, optionally including recursive sub-labels |
@@ -35,6 +37,16 @@ Label release rows include both `label_id` and legacy `via_label_id` during the
 rollout window. Recursive sub-label rollups use a 15 second PostgreSQL
 `statement_timeout`; timeout and pool-saturation failures return HTTP 503 with
 `{"error":"timeout","label_id":...}` or `{"error":"pool_unavailable","label_id":...}`.
+
+Artist master and appearance rows retain the legacy scalar `type` and also
+include `primary_types`, a sorted, deduplicated list of recognized structural
+types (`Album`, `EP`, `Single`). For a master this list aggregates format
+descriptions across every child pressing; for a masterless entry it reflects
+only that exact release. An empty list means the available Discogs descriptions
+do not identify a recognized structural type. `Compilation` is treated as a
+qualifier rather than structural type evidence, so a compilation-only entry is
+unknown; literal `Album`, `EP`, or `Single` descriptions still count when they
+appear alongside it.
 
 ### Examples
 
