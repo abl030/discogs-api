@@ -229,6 +229,15 @@ pub struct ArtistMasterEntry {
     /// do not map to Album, EP, or Single.
     #[serde(default)]
     pub primary_types: Vec<String>,
+    /// Sorted, deduplicated non-structural Discogs format descriptions across
+    /// every pressing represented by this entry.
+    #[serde(default)]
+    pub format_qualifiers: Vec<String>,
+    /// Sorted, deduplicated release-level provenance categories. A master may
+    /// contain any combination of `ordinary`, `promo`, and `unofficial` when
+    /// its child pressings differ.
+    #[serde(default)]
+    pub provenance: Vec<String>,
     pub first_release_date: String,
     pub artist_credit: String,
     pub primary_artist_id: Option<i32>,
@@ -474,12 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn artist_master_entry_serializes_primary_types_additively() {
+    fn artist_master_entry_serializes_additive_evidence_fields() {
         let entry = ArtistMasterEntry {
             id: MasterEntryId::Master(21491),
             title: "OK Computer".to_string(),
             type_: "Album".to_string(),
             primary_types: vec!["Album".to_string(), "EP".to_string()],
+            format_qualifiers: vec!["Compilation".to_string()],
+            provenance: vec!["ordinary".to_string()],
             first_release_date: "1997-06-16".to_string(),
             artist_credit: "Radiohead".to_string(),
             primary_artist_id: Some(3840),
@@ -489,5 +500,10 @@ mod tests {
         let value = serde_json::to_value(entry).expect("serialize artist master entry");
         assert_eq!(value["type"], "Album");
         assert_eq!(value["primary_types"], serde_json::json!(["Album", "EP"]));
+        assert_eq!(
+            value["format_qualifiers"],
+            serde_json::json!(["Compilation"])
+        );
+        assert_eq!(value["provenance"], serde_json::json!(["ordinary"]));
     }
 }
