@@ -28,6 +28,7 @@ Data source: ~11 GB compressed XML across 4 files (artists, labels, masters, rel
 | GET | `/api/artists/{id}` | Artist profile, aliases, name variations |
 | GET | `/api/artists/{id}/releases?page=1&per_page=100` | Paginated releases for an artist |
 | GET | `/api/artists/{id}/masters?page=1&per_page=100` | Paginated master and masterless discography entries for an artist |
+| GET | `/api/artists/{id}/masters/all` | Complete master and masterless discography in one response; explicit bulk route that fails loudly on older servers |
 | GET | `/api/artists/{id}/appearances` | Releases where an artist has track-level credits but no release-level credit |
 | GET | `/api/labels?name=X&page=1&per_page=25` | Label search with release counts and parent-label context |
 | GET | `/api/labels/{id}` | Label profile, parent, and direct sub-labels |
@@ -47,6 +48,14 @@ do not identify a recognized structural type. `Compilation` is treated as a
 qualifier rather than structural type evidence, so a compilation-only entry is
 unknown; literal `Album`, `EP`, or `Single` descriptions still count when they
 appear alongside it.
+
+The paginated artist-masters route remains compatible for existing clients.
+Bulk consumers should use the explicit `/masters/all` path instead of a large
+`per_page` value or an `all=true` query parameter: an older server returns 404
+for the explicit route rather than silently accepting an unknown parameter and
+truncating the catalogue. The bulk response uses the same
+`ArtistMastersResponse` fields (`results`, `total`, `page`, `per_page`) and the
+same `ArtistMasterEntry` row shape as the paginated route.
 
 ### Examples
 
@@ -83,8 +92,11 @@ Search uses PostgreSQL full-text search (`to_tsvector`/`plainto_tsquery`) with G
 Requires Rust 1.85+ (edition 2024), OpenSSL dev headers, and pkg-config.
 
 ```bash
-# With nix-shell
+# Build with nix-shell
 nix-shell -p cargo rustc pkg-config openssl --run "cargo build --release"
+
+# Run every test, including the generated real-PostgreSQL conservation checks
+nix-shell -p cargo rustc pkg-config openssl postgresql --run "cargo test"
 
 # Or directly
 cargo build --release

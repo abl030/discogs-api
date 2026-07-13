@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/artists/{id}", get(get_artist))
         .route("/api/artists/{id}/releases", get(get_artist_releases))
         .route("/api/artists/{id}/masters", get(get_artist_masters))
+        .route("/api/artists/{id}/masters/all", get(get_artist_masters_all))
         .route("/api/artists/{id}/appearances", get(get_artist_appearances))
         .route("/api/labels", get(search_labels))
         .route("/api/labels/{id}", get(get_label))
@@ -195,6 +196,20 @@ async fn get_artist_masters(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("artist masters query error: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_artist_masters_all(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<ArtistMastersResponse>, StatusCode> {
+    match db::query_artist_masters_all(&state.pool, id).await {
+        Ok(Some(r)) => Ok(Json(r)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("bulk artist masters query error: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

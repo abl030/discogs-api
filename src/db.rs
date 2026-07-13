@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::pin::pin;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deadpool_postgres::{
     Client as PooledClient, Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime,
@@ -1141,11 +1141,185 @@ pub async fn query_artist_search(
     })
 }
 
-pub async fn query_artist_masters(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtistMasterProjectionKind {
+    Master,
+    MasterlessRelease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtistMasterProjection {
+    kind: ArtistMasterProjectionKind,
+    entry_id: i32,
+    title: String,
+    rep_release_id: i32,
+    first_release_date: String,
+}
+
+/// Materialize the artist-credited release set once, then project masters with
+/// set-based grouping. The masterless UNION branch deliberately retains raw
+/// release_artist multiplicity: callers have historically received one row per
+/// matching artist credit for those releases.
+async fn fetch_artist_master_projection(
+    client: &Client,
+    artist_id: i32,
+) -> anyhow::Result<Vec<ArtistMasterProjection>> {
+    let rows = client
+        .query(
+            "WITH artist_releases AS MATERIALIZED (
+                 SELECT r.id, r.title, NULLIF(r.master_id, 0) AS master_id,
+                        NULLIF(r.released, '') AS released
+                 FROM release r
+                 JOIN release_artist ra ON ra.release_id = r.id
+                 WHERE ra.artist_id = $1
+             ),
+             master_groups AS (
+                 SELECT ar.master_id AS entry_id,
+                        (array_agg(ar.id ORDER BY ar.released NULLS LAST, ar.id))[1]
+                            AS fallback_release_id,
+                        MIN(ar.released) AS first_release_date
+                 FROM artist_releases ar
+                 WHERE ar.master_id IS NOT NULL
+                 GROUP BY ar.master_id
+             ),
+             master_entries AS (
+                 SELECT 'master'::text AS kind,
+                        m.id AS entry_id,
+                        m.title,
+                        COALESCE(m.main_release_id, mg.fallback_release_id) AS rep_release_id,
+                        mg.first_release_date
+                 FROM master_groups mg
+                 JOIN master m ON m.id = mg.entry_id
+             ),
+             combined AS (
+                 SELECT kind, entry_id, title, rep_release_id, first_release_date
+                 FROM master_entries
+                 UNION ALL
+                 SELECT 'release'::text AS kind,
+                        ar.id AS entry_id,
+                        ar.title,
+                        ar.id AS rep_release_id,
+                        ar.released AS first_release_date
+                 FROM artist_releases ar
+                 WHERE ar.master_id IS NULL
+             )
+             SELECT kind, entry_id, title, rep_release_id,
+                    COALESCE(first_release_date, '') AS released_date
+             FROM combined
+             ORDER BY first_release_date NULLS LAST,
+                      entry_id,
+                      CASE kind WHEN 'master' THEN 0 ELSE 1 END",
+            &[&artist_id],
+        )
+        .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let kind: String = row.get("kind");
+            Ok(ArtistMasterProjection {
+                kind: match kind.as_str() {
+                    "master" => ArtistMasterProjectionKind::Master,
+                    "release" => ArtistMasterProjectionKind::MasterlessRelease,
+                    other => anyhow::bail!("unexpected artist projection kind {other:?}"),
+                },
+                entry_id: row.get("entry_id"),
+                title: row.get("title"),
+                rep_release_id: row.get("rep_release_id"),
+                first_release_date: row.get("released_date"),
+            })
+        })
+        .collect()
+}
+
+async fn enrich_artist_master_projection(
+    client: &Client,
+    rows: &[ArtistMasterProjection],
+) -> anyhow::Result<Vec<ArtistMasterEntry>> {
+    let mut rep_release_ids = Vec::with_capacity(rows.len());
+    let mut master_ids = Vec::new();
+    let mut masterless_release_ids = Vec::new();
+    for row in rows {
+        rep_release_ids.push(row.rep_release_id);
+        match row.kind {
+            ArtistMasterProjectionKind::Master => master_ids.push(row.entry_id),
+            ArtistMasterProjectionKind::MasterlessRelease => {
+                masterless_release_ids.push(row.entry_id)
+            }
+        }
+    }
+
+    // Keep the legacy scalar based on the representative release, while the
+    // additive structural set covers every pressing represented by each row.
+    let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
+    let primary_type_maps =
+        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
+    let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
+    let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let descriptions = fmt_map
+                .get(&row.rep_release_id)
+                .cloned()
+                .unwrap_or_default();
+            let primary_type = infer_primary_type(&descriptions);
+            let (primary_types, pairs) = match row.kind {
+                ArtistMasterProjectionKind::Master => (
+                    primary_type_maps
+                        .masters
+                        .get(&row.entry_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    master_credit_map
+                        .get(&row.entry_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+                ArtistMasterProjectionKind::MasterlessRelease => (
+                    primary_type_maps
+                        .masterless_releases
+                        .get(&row.entry_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    release_credit_map
+                        .get(&row.entry_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            };
+            let primary_artist_id = pairs.first().map(|&(_, _, id)| id);
+            let name_join: Vec<(String, String)> = pairs
+                .into_iter()
+                .map(|(name, join, _)| (name, join))
+                .collect();
+            let artist_credit = join_artist_credit(&name_join);
+            let (id, is_masterless) = match row.kind {
+                ArtistMasterProjectionKind::Master => (MasterEntryId::Master(row.entry_id), false),
+                ArtistMasterProjectionKind::MasterlessRelease => (
+                    MasterEntryId::Release(format!("release-{}", row.entry_id)),
+                    true,
+                ),
+            };
+
+            ArtistMasterEntry {
+                id,
+                title: row.title.clone(),
+                type_: primary_type,
+                primary_types,
+                first_release_date: row.first_release_date.clone(),
+                artist_credit,
+                primary_artist_id,
+                is_masterless,
+            }
+        })
+        .collect())
+}
+
+async fn query_artist_masters_inner(
     pool: &Pool,
     artist_id: i32,
-    page: i32,
-    per_page: i32,
+    page: Option<(i32, i32)>,
 ) -> anyhow::Result<Option<ArtistMastersResponse>> {
     let client = get_client(pool).await?;
     let client = &**client;
@@ -1157,160 +1331,50 @@ pub async fn query_artist_masters(
         return Ok(None);
     }
 
-    let per_page = per_page.clamp(1, 100);
-    let page = page.max(1);
-    let limit = per_page as i64;
-    let offset = (page as i64 - 1) * limit;
+    let projection_started = Instant::now();
+    let projection = fetch_artist_master_projection(client, artist_id).await?;
+    let projection_elapsed = projection_started.elapsed();
+    let total = projection.len() as i64;
+    let bulk = page.is_none();
 
-    // The Discogs dump uses `master_id = 0` as the masterless sentinel
-    // (not NULL). Normalise both 0 and NULL to "no master" here so the
-    // count agrees with the projection — see the `NULLIF(r.master_id, 0)`
-    // alias in the data CTE below. Without this, an artist whose releases
-    // are all masterless reports `total > 0` but yields an empty result
-    // set (count(DISTINCT 0) = 1, but `master` has no id=0 row).
-    let count_row = client
-        .query_one(
-            "SELECT
-           (SELECT count(DISTINCT r.master_id) FROM release r
-              JOIN release_artist ra ON ra.release_id = r.id
-              WHERE ra.artist_id = $1 AND r.master_id IS NOT NULL AND r.master_id <> 0)
-         + (SELECT count(*) FROM release r
-              JOIN release_artist ra ON ra.release_id = r.id
-              WHERE ra.artist_id = $1 AND (r.master_id IS NULL OR r.master_id = 0))
-         AS total",
-            &[&artist_id],
-        )
-        .await?;
-    let total: i64 = count_row.get("total");
-
-    let rows = client.query(
-        "WITH ar AS (
-             SELECT r.id, r.title, NULLIF(r.master_id, 0) AS master_id,
-                    NULLIF(r.released, '') AS released
-             FROM release r
-             JOIN release_artist ra ON ra.release_id = r.id
-             WHERE ra.artist_id = $1
-         ),
-         combined AS (
-             SELECT 'master'::text AS kind,
-                    m.id AS entry_id,
-                    m.title AS title,
-                    COALESCE(
-                        m.main_release_id,
-                        (SELECT ar2.id FROM ar ar2 WHERE ar2.master_id = m.id
-                         ORDER BY ar2.released NULLS LAST, ar2.id LIMIT 1)
-                    ) AS rep_release_id,
-                    (SELECT MIN(ar2.released) FROM ar ar2 WHERE ar2.master_id = m.id) AS first_release_date
-             FROM master m
-             WHERE EXISTS (SELECT 1 FROM ar WHERE ar.master_id = m.id)
-             UNION ALL
-             SELECT 'release'::text AS kind,
-                    ar.id AS entry_id,
-                    ar.title AS title,
-                    ar.id AS rep_release_id,
-                    ar.released AS first_release_date
-             FROM ar
-             WHERE ar.master_id IS NULL
-         )
-         SELECT kind, entry_id, title, rep_release_id,
-                COALESCE(first_release_date, '') AS released_date
-         FROM combined
-         ORDER BY first_release_date NULLS LAST, entry_id
-         LIMIT $2 OFFSET $3",
-        &[&artist_id, &limit, &offset],
-    ).await?;
-
-    // Collect ids we need to enrich.
-    let mut rep_release_ids: Vec<i32> = Vec::with_capacity(rows.len());
-    let mut master_ids: Vec<i32> = Vec::new();
-    let mut masterless_release_ids: Vec<i32> = Vec::new();
-    for r in &rows {
-        let rep: i32 = r.get("rep_release_id");
-        rep_release_ids.push(rep);
-        let kind: String = r.get("kind");
-        let entry_id: i32 = r.get("entry_id");
-        if kind == "master" {
-            master_ids.push(entry_id);
-        } else {
-            masterless_release_ids.push(entry_id);
+    let (page, per_page, selected) = match page {
+        Some((page, per_page)) => {
+            let page = page.max(1);
+            let per_page = per_page.clamp(1, 100);
+            let start = ((page as usize).saturating_sub(1)).saturating_mul(per_page as usize);
+            let end = start
+                .saturating_add(per_page as usize)
+                .min(projection.len());
+            let selected = if start < projection.len() {
+                projection[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            (page, per_page, selected)
         }
+        None => (1, total.max(1) as i32, projection),
+    };
+
+    if bulk {
+        tracing::info!(
+            artist_id,
+            total,
+            selected = selected.len(),
+            elapsed_ms = projection_elapsed.as_millis() as u64,
+            "bulk artist masters projection complete"
+        );
     }
 
-    // Keep the legacy scalar based on the representative release, while the
-    // additive structural set covers every pressing represented by each row.
-    let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
-    let primary_type_maps =
-        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
-    // Artist-credit pairs.
-    let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
-    let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
-
-    let results: Vec<ArtistMasterEntry> = rows
-        .iter()
-        .map(|r| {
-            let kind: String = r.get("kind");
-            let entry_id: i32 = r.get("entry_id");
-            let title: String = r.get("title");
-            let rep: i32 = r.get("rep_release_id");
-            let first_release_date: String = r.get("released_date");
-
-            let descriptions = fmt_map.get(&rep).cloned().unwrap_or_default();
-            let primary_type = infer_primary_type(&descriptions);
-            let primary_types = if kind == "master" {
-                primary_type_maps
-                    .masters
-                    .get(&entry_id)
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                primary_type_maps
-                    .masterless_releases
-                    .get(&entry_id)
-                    .cloned()
-                    .unwrap_or_default()
-            };
-
-            let (credit_str, primary_artist) = if kind == "master" {
-                let pairs = master_credit_map
-                    .get(&entry_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let primary = pairs.first().map(|&(_, _, id)| id);
-                let name_join: Vec<(String, String)> =
-                    pairs.into_iter().map(|(n, j, _)| (n, j)).collect();
-                (join_artist_credit(&name_join), primary)
-            } else {
-                let pairs = release_credit_map
-                    .get(&entry_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let primary = pairs.first().map(|&(_, _, id)| id);
-                let name_join: Vec<(String, String)> =
-                    pairs.into_iter().map(|(n, j, _)| (n, j)).collect();
-                (join_artist_credit(&name_join), primary)
-            };
-
-            let (id_value, is_masterless) = if kind == "master" {
-                (MasterEntryId::Master(entry_id), false)
-            } else {
-                (
-                    MasterEntryId::Release(format!("release-{}", entry_id)),
-                    true,
-                )
-            };
-
-            ArtistMasterEntry {
-                id: id_value,
-                title,
-                type_: primary_type,
-                primary_types,
-                first_release_date,
-                artist_credit: credit_str,
-                primary_artist_id: primary_artist,
-                is_masterless,
-            }
-        })
-        .collect();
+    let enrichment_started = Instant::now();
+    let results = enrich_artist_master_projection(client, &selected).await?;
+    if bulk {
+        tracing::info!(
+            artist_id,
+            selected = results.len(),
+            elapsed_ms = enrichment_started.elapsed().as_millis() as u64,
+            "bulk artist masters enrichment complete"
+        );
+    }
 
     Ok(Some(ArtistMastersResponse {
         results,
@@ -1318,6 +1382,27 @@ pub async fn query_artist_masters(
         page,
         per_page,
     }))
+}
+
+/// Legacy paginated artist discography. Projection is set-based and complete,
+/// then only the selected page is enriched.
+pub async fn query_artist_masters(
+    pool: &Pool,
+    artist_id: i32,
+    page: i32,
+    per_page: i32,
+) -> anyhow::Result<Option<ArtistMastersResponse>> {
+    query_artist_masters_inner(pool, artist_id, Some((page, per_page))).await
+}
+
+/// Complete artist discography in the established ArtistMastersResponse wire
+/// shape. This explicit owner backs `/api/artists/{id}/masters/all`; callers do
+/// not rely on pagination parameters that an older server could ignore.
+pub async fn query_artist_masters_all(
+    pool: &Pool,
+    artist_id: i32,
+) -> anyhow::Result<Option<ArtistMastersResponse>> {
+    query_artist_masters_inner(pool, artist_id, None).await
 }
 
 /// Releases where the artist appears via a track-level credit only —
@@ -1839,7 +1924,10 @@ async fn fetch_format_descriptions(
     }
     let rows = client
         .query(
-            "SELECT release_id, descriptions FROM release_format WHERE release_id = ANY($1)",
+            "SELECT release_id, descriptions
+             FROM release_format
+             WHERE release_id = ANY($1)
+             ORDER BY release_id, ctid",
             &[&release_ids],
         )
         .await?;
@@ -1963,7 +2051,10 @@ async fn fetch_master_artist_credits(
     }
     let rows = client
         .query(
-            "SELECT master_id, artist_id, artist_name FROM master_artist WHERE master_id = ANY($1)",
+            "SELECT master_id, artist_id, artist_name
+             FROM master_artist
+             WHERE master_id = ANY($1)
+             ORDER BY master_id, ctid",
             &[&master_ids],
         )
         .await?;
@@ -1988,7 +2079,9 @@ async fn fetch_release_artist_credits(
     let rows = client
         .query(
             "SELECT release_id, artist_id, artist_name, join_relation
-         FROM release_artist WHERE release_id = ANY($1)",
+             FROM release_artist
+             WHERE release_id = ANY($1)
+             ORDER BY release_id, ctid",
             &[&release_ids],
         )
         .await?;
