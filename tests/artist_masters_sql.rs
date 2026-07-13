@@ -13,6 +13,8 @@ use tokio::runtime::Runtime;
 
 const ARTIST_ID: i32 = 1;
 
+const NULL_PRIMARY_ARTIST_FIXTURE_JSON: &str = r#"{"id":60,"title":"Mixed appearance master","type":"EP","primary_types":["EP","Single"],"first_release_date":"2005","artist_credit":"","primary_artist_id":null,"is_masterless":false}"#;
+
 struct EphemeralPostgres {
     child: Child,
     _root: TempDir,
@@ -114,12 +116,17 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
         .batch_execute(
             "
             INSERT INTO artist (id, name) VALUES
-                (1, 'Target'), (2, 'Guest'), (3, 'Empty Artist');
+                (1, 'Target'), (2, 'Guest'), (3, 'Empty Artist'),
+                (4, 'Master-only Appearance'),
+                (5, 'Masterless-only Appearance'),
+                (6, 'No Appearances');
             INSERT INTO master (id, title, main_release_id) VALUES
                 (10, 'Main release wins', 101),
                 (20, 'Fallback tie', NULL),
                 (30, 'Compilation only', 301),
-                (50, 'Numeric namespace master', 501);
+                (50, 'Numeric namespace master', 501),
+                (60, 'Mixed appearance master', 601),
+                (70, 'Compilation appearance master', 701);
             INSERT INTO release (id, title, released, master_id) VALUES
                 (101, 'Uncredited main release', '2002', 10),
                 (102, 'Artist subset release', '1999', 10),
@@ -130,7 +137,12 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
                 (50, 'Numeric namespace release', '2001', NULL),
                 (400, 'Duplicate masterless zero', '2003', 0),
                 (401, 'Mini album masterless null', '2004', NULL),
-                (402, 'Compilation masterless null', '', NULL);
+                (402, 'Compilation masterless null', '', NULL),
+                (601, 'EP appearance child', '2005', 60),
+                (602, 'Single appearance child', '2006', 60),
+                (60, 'Numeric appearance release', '2007', NULL),
+                (700, 'Zero sentinel appearance', '2008', 0),
+                (701, 'Compilation appearance child', '', 70);
             INSERT INTO release_artist
                 (release_id, artist_id, artist_name, join_relation)
             VALUES
@@ -145,12 +157,15 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
                 (400, 1, 'Target', ''),
                 (401, 1, 'Target', ''),
                 (401, 2, 'Guest', 'feat.'),
-                (402, 1, 'Target', '');
+                (402, 1, 'Target', ''),
+                (60, 2, 'Guest', ''),
+                (700, 2, 'Guest', '');
             INSERT INTO master_artist (master_id, artist_id, artist_name) VALUES
                 (10, 1, 'Target'),
                 (10, 2, 'Guest'),
                 (30, 1, 'Target'),
-                (50, 1, 'Target');
+                (50, 1, 'Target'),
+                (70, 2, 'Guest');
             INSERT INTO release_format (release_id, descriptions) VALUES
                 (101, 'Album, Compilation'),
                 (102, 'Single'),
@@ -161,7 +176,22 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
                 (50, 'Album'),
                 (400, 'Single, Single'),
                 (401, 'Mini-Album, Compilation'),
-                (402, 'Compilation');
+                (402, 'Compilation'),
+                (601, 'EP, Compilation'),
+                (602, 'Single, Promo'),
+                (60, 'Album, Compilation'),
+                (700, 'Single, Unofficial Release'),
+                (701, 'Compilation');
+            INSERT INTO release_track_artist
+                (release_id, sequence, artist_id, artist_name)
+            VALUES
+                (601, 1, 1, 'Target'),
+                (602, 1, 1, 'Target'),
+                (60, 1, 1, 'Target'),
+                (700, 1, 1, 'Target'),
+                (701, 1, 1, 'Target'),
+                (601, 2, 4, 'Master-only Appearance'),
+                (60, 2, 5, 'Masterless-only Appearance');
             ",
         )
         .await
@@ -228,6 +258,138 @@ fn assert_conserved(legacy: &[Value], legacy_total: i64, bulk: &[Value], bulk_to
     if let Err(error) = check_conserved(legacy, legacy_total, bulk, bulk_total) {
         panic!("artist masters conservation failed: {error}");
     }
+}
+
+fn expected_appearance_rows() -> Vec<Value> {
+    vec![
+        json!({
+            "id": 60, "title": "Mixed appearance master", "type": "EP",
+            "primary_types": ["EP", "Single"],
+            "first_release_date": "2005", "artist_credit": "",
+            "primary_artist_id": null, "is_masterless": false
+        }),
+        json!({
+            "id": "release-60", "title": "Numeric appearance release", "type": "Album",
+            "primary_types": ["Album"],
+            "first_release_date": "2007", "artist_credit": "Guest",
+            "primary_artist_id": 2, "is_masterless": true
+        }),
+        json!({
+            "id": "release-700", "title": "Zero sentinel appearance", "type": "Single",
+            "primary_types": ["Single"],
+            "first_release_date": "2008", "artist_credit": "Guest",
+            "primary_artist_id": 2, "is_masterless": true
+        }),
+        json!({
+            "id": 70, "title": "Compilation appearance master", "type": "Album",
+            "primary_types": [],
+            "first_release_date": "", "artist_credit": "Guest",
+            "primary_artist_id": 2, "is_masterless": false
+        }),
+    ]
+}
+
+fn check_appearance_rows(actual: &[Value], expected: &[Value]) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "appearance row count differs: actual={}, expected={}",
+            actual.len(),
+            expected.len()
+        ));
+    }
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        if actual != expected {
+            return Err(format!("appearance row {index} differs"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
+    let postgres = EphemeralPostgres::start();
+    let runtime = Runtime::new().expect("create runtime");
+    runtime.block_on(async {
+        let pool = initialize(&postgres.dsn).await;
+        seed_contract_fixture(&pool).await;
+
+        let response = db::query_artist_appearances(&pool, ARTIST_ID)
+            .await
+            .expect("query appearances")
+            .expect("artist exists");
+        let rows = response_rows(&response);
+        assert_eq!(response.total, 4);
+        let expected = expected_appearance_rows();
+        check_appearance_rows(&rows, &expected).expect("appearance rows match strict fixture");
+        assert_eq!(
+            serde_json::to_string(&response.results[0]).expect("serialize nullable fixture"),
+            NULL_PRIMARY_ARTIST_FIXTURE_JSON
+        );
+
+        // One-sided result sets exercise the same real enrichment query with
+        // an empty int4[] in the opposite namespace. The empty artist pins the
+        // early return for two empty arrays.
+        let master_only = db::query_artist_appearances(&pool, 4)
+            .await
+            .expect("query master-only appearances")
+            .expect("master-only artist exists");
+        assert_eq!(master_only.total, 1);
+        assert_eq!(
+            response_rows(&master_only)[0],
+            json!({
+                "id": 60, "title": "Mixed appearance master", "type": "EP",
+                "primary_types": ["EP", "Single"],
+                "first_release_date": "2005", "artist_credit": "",
+                "primary_artist_id": null, "is_masterless": false
+            })
+        );
+
+        let masterless_only = db::query_artist_appearances(&pool, 5)
+            .await
+            .expect("query masterless-only appearances")
+            .expect("masterless-only artist exists");
+        assert_eq!(masterless_only.total, 1);
+        assert_eq!(
+            response_rows(&masterless_only)[0],
+            json!({
+                "id": "release-60", "title": "Numeric appearance release", "type": "Album",
+                "primary_types": ["Album"],
+                "first_release_date": "2007", "artist_credit": "Guest",
+                "primary_artist_id": 2, "is_masterless": true
+            })
+        );
+
+        let empty = db::query_artist_appearances(&pool, 6)
+            .await
+            .expect("query empty appearances")
+            .expect("empty artist exists");
+        assert_eq!(empty.total, 0);
+        assert!(empty.results.is_empty());
+
+        let mut namespace_mutant = rows.clone();
+        namespace_mutant[0]["id"] = json!("release-60");
+        assert!(
+            check_appearance_rows(&namespace_mutant, &expected).is_err(),
+            "checker accepted a master/release namespace mutant"
+        );
+
+        let mut typing_mutant = rows.clone();
+        typing_mutant[0]["primary_types"] = json!(["EP"]);
+        assert!(
+            check_appearance_rows(&typing_mutant, &expected).is_err(),
+            "checker accepted a child-pressing type-loss mutant"
+        );
+
+        let mut missing_field_mutant = rows.clone();
+        missing_field_mutant[0]
+            .as_object_mut()
+            .expect("serialized row is an object")
+            .remove("primary_types");
+        assert!(
+            check_appearance_rows(&missing_field_mutant, &expected).is_err(),
+            "checker accepted a missing additive primary_types field"
+        );
+    });
 }
 
 #[test]
@@ -376,10 +538,10 @@ enum Evidence {
 impl Evidence {
     fn description(&self) -> &'static str {
         match self {
-            Self::Album => "Album",
-            Self::Ep => "EP",
-            Self::MiniAlbum => "Mini-Album",
-            Self::Single => "Single",
+            Self::Album => "Album, Compilation",
+            Self::Ep => "EP, Compilation",
+            Self::MiniAlbum => "Mini-Album, Compilation",
+            Self::Single => "Single, Promo",
             Self::Compilation => "Compilation",
             Self::Unknown => "Box Set, Promo",
         }
@@ -521,12 +683,13 @@ fn generated_world_strategy() -> impl Strategy<Value = GeneratedWorld> {
             masters[0].first_evidence = Evidence::Album;
             masters[0].second_evidence = Evidence::Single;
             masters[0].credit_second_release = false;
+            masters[0].has_master_credit = false;
 
             masters[1].main_release = false;
             masters[1].first_date = "2000".to_string();
             masters[1].second_date = "2000".to_string();
-            masters[1].first_evidence = Evidence::MiniAlbum;
-            masters[1].second_evidence = Evidence::Compilation;
+            masters[1].first_evidence = Evidence::Ep;
+            masters[1].second_evidence = Evidence::Single;
             masters[1].credit_second_release = true;
 
             masters[2].first_evidence = Evidence::Compilation;
@@ -573,8 +736,13 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
     let transaction = client.transaction().await.expect("start seed transaction");
     transaction
         .batch_execute(
-            "TRUNCATE master_artist, release_format, release_artist, release, master, artist;
-             INSERT INTO artist (id, name) VALUES (1, 'Target'), (2, 'Guest');",
+            "TRUNCATE master_artist, release_track_artist, release_format,
+                      release_artist, release, master, artist;
+             INSERT INTO artist (id, name) VALUES
+                 (1, 'Target'), (2, 'Guest'), (3, 'Appearing'),
+                 (4, 'Master-only Appearance'),
+                 (5, 'Masterless-only Appearance'),
+                 (6, 'No Appearances');",
         )
         .await
         .expect("reset generated world");
@@ -621,6 +789,15 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
                 )
                 .await
                 .expect("insert generated master format");
+            transaction
+                .execute(
+                    "INSERT INTO release_track_artist
+                     (release_id, sequence, artist_id, artist_name)
+                     VALUES ($1, 1, 3, 'Appearing')",
+                    &[&release_id],
+                )
+                .await
+                .expect("insert generated appearance credit");
             if credited {
                 transaction
                     .execute(
@@ -632,6 +809,18 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
                     .await
                     .expect("insert generated artist release credit");
             }
+        }
+
+        if index == 0 {
+            transaction
+                .execute(
+                    "INSERT INTO release_track_artist
+                     (release_id, sequence, artist_id, artist_name)
+                     VALUES ($1, 2, 4, 'Master-only Appearance')",
+                    &[&first_release_id],
+                )
+                .await
+                .expect("insert generated master-only appearance credit");
         }
 
         if spec.has_master_credit {
@@ -675,6 +864,26 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
                 )
                 .await
                 .expect("insert generated masterless format");
+        }
+        transaction
+            .execute(
+                "INSERT INTO release_track_artist
+                 (release_id, sequence, artist_id, artist_name)
+                 VALUES ($1, 1, 3, 'Appearing')",
+                &[&release_id],
+            )
+            .await
+            .expect("insert generated masterless appearance credit");
+        if index == 0 {
+            transaction
+                .execute(
+                    "INSERT INTO release_track_artist
+                     (release_id, sequence, artist_id, artist_name)
+                     VALUES ($1, 2, 5, 'Masterless-only Appearance')",
+                    &[&release_id],
+                )
+                .await
+                .expect("insert generated masterless-only appearance credit");
         }
         for _ in 0..spec.duplicate_credits {
             transaction
@@ -840,8 +1049,136 @@ fn expected_generated_rows(world: &GeneratedWorld) -> Vec<Value> {
     rows.into_iter().map(|row| row.value).collect()
 }
 
+fn first_appearance_date(spec: &MasterSpec) -> Option<String> {
+    [
+        normalized_date(&spec.first_date),
+        normalized_date(&spec.second_date),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn appearance_representative_index(spec: &MasterSpec) -> usize {
+    if spec.main_release {
+        return 0;
+    }
+    match (
+        normalized_date(&spec.first_date),
+        normalized_date(&spec.second_date),
+    ) {
+        (Some(first), Some(second)) if second < first => 1,
+        (None, Some(_)) => 1,
+        _ => 0,
+    }
+}
+
+fn expected_generated_appearance_rows(world: &GeneratedWorld) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (index, spec) in world.masters.iter().enumerate() {
+        let id = master_id(index);
+        let rep = if appearance_representative_index(spec) == 0 {
+            &spec.first_evidence
+        } else {
+            &spec.second_evidence
+        };
+        let date = first_appearance_date(spec);
+        let (artist_credit, primary_artist_id) = if spec.has_master_credit {
+            (
+                if spec.guest_master_credit {
+                    "Target & Guest"
+                } else {
+                    "Target"
+                },
+                json!(1),
+            )
+        } else {
+            ("", Value::Null)
+        };
+        rows.push(ExpectedRow {
+            sort_date: date.clone(),
+            entry_id: id,
+            kind_order: 0,
+            value: json!({
+                "id": id,
+                "title": format!("Master {id}"),
+                "type": rep.scalar_type(),
+                "primary_types": structural_types([&spec.first_evidence, &spec.second_evidence]),
+                "first_release_date": date.unwrap_or_default(),
+                "artist_credit": artist_credit,
+                "primary_artist_id": primary_artist_id,
+                "is_masterless": false,
+            }),
+        });
+    }
+
+    for (index, spec) in world.masterless.iter().enumerate() {
+        let id = masterless_release_id(index);
+        let date = normalized_date(&spec.date);
+        let duplicate_names = std::iter::repeat_n("Target", spec.duplicate_credits as usize)
+            .collect::<Vec<_>>()
+            .join(" & ");
+        let artist_credit = if spec.guest_credit {
+            format!("{duplicate_names} feat. Guest")
+        } else {
+            duplicate_names
+        };
+        rows.push(ExpectedRow {
+            sort_date: date.clone(),
+            entry_id: id,
+            kind_order: 1,
+            value: json!({
+                "id": format!("release-{id}"),
+                "title": format!("Masterless {id}"),
+                "type": scalar_type(&spec.evidence),
+                "primary_types": structural_types(&spec.evidence),
+                "first_release_date": date.unwrap_or_default(),
+                "artist_credit": artist_credit,
+                "primary_artist_id": 1,
+                "is_masterless": true,
+            }),
+        });
+    }
+
+    rows.sort_by(|left, right| {
+        left.sort_date
+            .is_none()
+            .cmp(&right.sort_date.is_none())
+            .then_with(|| left.sort_date.cmp(&right.sort_date))
+            .then_with(|| left.entry_id.cmp(&right.entry_id))
+            .then_with(|| left.kind_order.cmp(&right.kind_order))
+    });
+    rows.into_iter().map(|row| row.value).collect()
+}
+
+fn expected_master_only_appearance(world: &GeneratedWorld) -> Value {
+    let spec = &world.masters[0];
+    let (artist_credit, primary_artist_id) = if spec.has_master_credit {
+        (
+            if spec.guest_master_credit {
+                "Target & Guest"
+            } else {
+                "Target"
+            },
+            json!(1),
+        )
+    } else {
+        ("", Value::Null)
+    };
+    json!({
+        "id": master_id(0),
+        "title": format!("Master {}", master_id(0)),
+        "type": spec.first_evidence.scalar_type(),
+        "primary_types": structural_types([&spec.first_evidence, &spec.second_evidence]),
+        "first_release_date": spec.first_date,
+        "artist_credit": artist_credit,
+        "primary_artist_id": primary_artist_id,
+        "is_masterless": false,
+    })
+}
+
 #[test]
-fn generated_bulk_conserves_every_legacy_page() {
+fn generated_artist_queries_match_real_sql_contracts() {
     let postgres = EphemeralPostgres::start();
     let runtime = Runtime::new().expect("create generated runtime");
     let pool = runtime.block_on(initialize(&postgres.dsn));
@@ -861,8 +1198,50 @@ fn generated_bulk_conserves_every_legacy_page() {
                 check_conserved(&legacy, legacy_total, &bulk, response.total)
                     .map_err(TestCaseError::fail)?;
                 prop_assert_eq!(bulk, expected_generated_rows(&world));
+
+                let appearances = db::query_artist_appearances(&pool, 3)
+                    .await
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?
+                    .ok_or_else(|| {
+                        TestCaseError::fail("generated appearance artist disappeared")
+                    })?;
+                let appearance_rows = response_rows(&appearances);
+                let expected_appearances = expected_generated_appearance_rows(&world);
+                check_appearance_rows(&appearance_rows, &expected_appearances)
+                    .map_err(TestCaseError::fail)?;
+                prop_assert_eq!(appearances.total as usize, appearance_rows.len());
+
+                let master_only = db::query_artist_appearances(&pool, 4)
+                    .await
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?
+                    .ok_or_else(|| TestCaseError::fail("master-only artist disappeared"))?;
+                let master_only_rows = response_rows(&master_only);
+                prop_assert_eq!(master_only_rows.len(), 1);
+                prop_assert_eq!(
+                    &master_only_rows[0],
+                    &expected_master_only_appearance(&world)
+                );
+
+                let masterless_only = db::query_artist_appearances(&pool, 5)
+                    .await
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?
+                    .ok_or_else(|| TestCaseError::fail("masterless-only artist disappeared"))?;
+                let masterless_only_rows = response_rows(&masterless_only);
+                prop_assert_eq!(masterless_only_rows.len(), 1);
+                let expected_masterless = expected_appearances
+                    .iter()
+                    .find(|row| row["id"] == format!("release-{}", masterless_release_id(0)))
+                    .ok_or_else(|| TestCaseError::fail("expected collision release missing"))?;
+                prop_assert_eq!(&masterless_only_rows[0], expected_masterless);
+
+                let empty = db::query_artist_appearances(&pool, 6)
+                    .await
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?
+                    .ok_or_else(|| TestCaseError::fail("empty artist disappeared"))?;
+                prop_assert_eq!(empty.total, 0);
+                prop_assert!(empty.results.is_empty());
                 Ok(())
             })
         })
-        .expect("generated real-SQL conservation contract");
+        .expect("generated real-SQL artist query contracts");
 }
