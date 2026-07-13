@@ -25,11 +25,13 @@ Two binaries from one crate: `discogs-import` (oneshot) and `discogs-api` (long-
 
 ```bash
 nix-shell -p cargo rustc pkg-config openssl --run "cargo check"
-nix-shell -p cargo rustc pkg-config openssl --run "cargo test"
+nix-shell -p cargo rustc pkg-config openssl postgresql --run "cargo test"
 nix-shell -p cargo rustc pkg-config openssl --run "cargo build --release"
 ```
 
-Tests cover the XML parsers (4 tests in `src/xml.rs`). No integration tests — DB layer is verified against the live instance.
+Tests include parser/unit coverage plus generated SQL conservation checks that
+start an ephemeral Nix-provided PostgreSQL instance. PostgreSQL must therefore
+be on `PATH` for every `cargo test`; tests never skip or fall back to a live DB.
 
 ## Infrastructure
 
