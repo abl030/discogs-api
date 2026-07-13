@@ -224,6 +224,11 @@ pub struct ArtistMasterEntry {
     pub title: String,
     #[serde(rename = "type")]
     pub type_: String,
+    /// Recognized structural types found across every pressing represented by
+    /// this entry. Empty means the Discogs format descriptions are unknown or
+    /// do not map to Album, EP, or Single.
+    #[serde(default)]
+    pub primary_types: Vec<String>,
     pub first_release_date: String,
     pub artist_credit: String,
     pub primary_artist_id: Option<i32>,
@@ -466,5 +471,23 @@ mod tests {
         let value = serde_json::to_value(entry).expect("serialize label release entry");
         assert_eq!(value["label_id"], 2294);
         assert_eq!(value["via_label_id"], 2294);
+    }
+
+    #[test]
+    fn artist_master_entry_serializes_primary_types_additively() {
+        let entry = ArtistMasterEntry {
+            id: MasterEntryId::Master(21491),
+            title: "OK Computer".to_string(),
+            type_: "Album".to_string(),
+            primary_types: vec!["Album".to_string(), "EP".to_string()],
+            first_release_date: "1997-06-16".to_string(),
+            artist_credit: "Radiohead".to_string(),
+            primary_artist_id: Some(3840),
+            is_masterless: false,
+        };
+
+        let value = serde_json::to_value(entry).expect("serialize artist master entry");
+        assert_eq!(value["type"], "Album");
+        assert_eq!(value["primary_types"], serde_json::json!(["Album", "EP"]));
     }
 }

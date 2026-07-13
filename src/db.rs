@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::pin::pin;
 use std::str::FromStr;
@@ -1236,8 +1236,11 @@ pub async fn query_artist_masters(
         }
     }
 
-    // Format descriptions per rep release (for primary_type inference).
+    // Keep the legacy scalar based on the representative release, while the
+    // additive structural set covers every pressing represented by each row.
     let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
+    let (master_type_map, release_type_map) =
+        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
     // Artist-credit pairs.
     let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
     let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
@@ -1253,6 +1256,11 @@ pub async fn query_artist_masters(
 
             let descriptions = fmt_map.get(&rep).cloned().unwrap_or_default();
             let primary_type = infer_primary_type(&descriptions);
+            let primary_types = if kind == "master" {
+                master_type_map.get(&entry_id).cloned().unwrap_or_default()
+            } else {
+                release_type_map.get(&entry_id).cloned().unwrap_or_default()
+            };
 
             let (credit_str, primary_artist) = if kind == "master" {
                 let pairs = master_credit_map
@@ -1287,6 +1295,7 @@ pub async fn query_artist_masters(
                 id: id_value,
                 title,
                 type_: primary_type,
+                primary_types,
                 first_release_date,
                 artist_credit: credit_str,
                 primary_artist_id: primary_artist,
@@ -1387,6 +1396,8 @@ pub async fn query_artist_appearances(
     }
 
     let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
+    let (master_type_map, release_type_map) =
+        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
     let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
     let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
 
@@ -1401,6 +1412,11 @@ pub async fn query_artist_appearances(
 
             let descriptions = fmt_map.get(&rep).cloned().unwrap_or_default();
             let primary_type = infer_primary_type(&descriptions);
+            let primary_types = if kind == "master" {
+                master_type_map.get(&entry_id).cloned().unwrap_or_default()
+            } else {
+                release_type_map.get(&entry_id).cloned().unwrap_or_default()
+            };
 
             let (credit_str, primary_artist) = if kind == "master" {
                 let pairs = master_credit_map
@@ -1435,6 +1451,7 @@ pub async fn query_artist_appearances(
                 id: id_value,
                 title,
                 type_: primary_type,
+                primary_types,
                 first_release_date,
                 artist_credit: credit_str,
                 primary_artist_id: primary_artist,
@@ -1818,6 +1835,72 @@ async fn fetch_format_descriptions(
     Ok(map)
 }
 
+type ArtistEntryPrimaryTypeMaps = (HashMap<i32, Vec<String>>, HashMap<i32, Vec<String>>);
+
+/// Fetch structural type evidence for one artist endpoint result set.
+///
+/// Masters aggregate format descriptions across every child release, while
+/// masterless entries use only their exact release. Both groups are fetched in
+/// a single page-level query so endpoint cost does not grow by one query per
+/// result row.
+async fn fetch_artist_entry_primary_types(
+    client: &Client,
+    master_ids: &[i32],
+    masterless_release_ids: &[i32],
+) -> anyhow::Result<ArtistEntryPrimaryTypeMaps> {
+    let mut master_descriptions: HashMap<i32, Vec<String>> = HashMap::new();
+    let mut release_descriptions: HashMap<i32, Vec<String>> = HashMap::new();
+    if master_ids.is_empty() && masterless_release_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+
+    let rows = client
+        .query(
+            "SELECT 'master'::text AS kind,
+                    r.master_id AS entry_id,
+                    rf.descriptions
+             FROM release r
+             JOIN release_format rf ON rf.release_id = r.id
+             WHERE r.master_id = ANY($1)
+             UNION ALL
+             SELECT 'release'::text AS kind,
+                    rf.release_id AS entry_id,
+                    rf.descriptions
+             FROM release_format rf
+             WHERE rf.release_id = ANY($2)",
+            &[&master_ids, &masterless_release_ids],
+        )
+        .await?;
+
+    for row in rows {
+        let kind: String = row.get("kind");
+        let entry_id: i32 = row.get("entry_id");
+        let descriptions: String = row.get("descriptions");
+        if kind == "master" {
+            master_descriptions
+                .entry(entry_id)
+                .or_default()
+                .push(descriptions);
+        } else {
+            release_descriptions
+                .entry(entry_id)
+                .or_default()
+                .push(descriptions);
+        }
+    }
+
+    let master_types = master_descriptions
+        .into_iter()
+        .map(|(id, descriptions)| (id, structural_primary_types(&descriptions)))
+        .collect();
+    let release_types = release_descriptions
+        .into_iter()
+        .map(|(id, descriptions)| (id, structural_primary_types(&descriptions)))
+        .collect();
+
+    Ok((master_types, release_types))
+}
+
 // Returns master_id -> Vec<(artist_name, join_relation="", artist_id)> (master_artist has no join column).
 async fn fetch_master_artist_credits(
     client: &Client,
@@ -1895,6 +1978,59 @@ fn infer_primary_type(description_rows: &[String]) -> String {
         }
     }
     "Other".to_string()
+}
+
+fn structural_primary_types(description_rows: &[String]) -> Vec<String> {
+    let mut types = BTreeSet::new();
+    for row in description_rows {
+        for description in row.split(',').map(str::trim) {
+            let normalized = match description {
+                "Album" | "Compilation" => Some("Album"),
+                "EP" | "Mini-Album" => Some("EP"),
+                "Single" => Some("Single"),
+                _ => None,
+            };
+            if let Some(primary_type) = normalized {
+                types.insert(primary_type.to_string());
+            }
+        }
+    }
+    types.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::structural_primary_types;
+
+    #[test]
+    fn structural_primary_types_normalize_recognized_discogs_descriptions() {
+        let descriptions = vec![
+            "Compilation, Album".to_string(),
+            "Mini-Album, EP".to_string(),
+            "Single".to_string(),
+            "Unofficial Release, Promo".to_string(),
+        ];
+
+        assert_eq!(
+            structural_primary_types(&descriptions),
+            vec!["Album", "EP", "Single"]
+        );
+    }
+
+    #[test]
+    fn structural_primary_types_are_sorted_deduplicated_and_exclude_unknowns() {
+        let descriptions = vec![
+            "Single, Album, Single".to_string(),
+            "EP, Compilation, Mini-Album".to_string(),
+            "Box Set".to_string(),
+        ];
+
+        assert_eq!(
+            structural_primary_types(&descriptions),
+            vec!["Album", "EP", "Single"]
+        );
+        assert!(structural_primary_types(&["Box Set, Promo".to_string()]).is_empty());
+    }
 }
 
 // Join (name, join_relation) pairs into an MB-style artist-credit string.
