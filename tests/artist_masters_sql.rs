@@ -13,7 +13,7 @@ use tokio::runtime::Runtime;
 
 const ARTIST_ID: i32 = 1;
 
-const NULL_PRIMARY_ARTIST_FIXTURE_JSON: &str = r#"{"id":60,"title":"Mixed appearance master","type":"EP","primary_types":["EP","Single"],"first_release_date":"2005","artist_credit":"","primary_artist_id":null,"is_masterless":false}"#;
+const NULL_PRIMARY_ARTIST_FIXTURE_JSON: &str = r#"{"id":60,"title":"Mixed appearance master","type":"EP","primary_types":["EP","Single"],"format_qualifiers":["Compilation","Promo","Unofficial Release"],"provenance":["ordinary","promo","unofficial"],"first_release_date":"2005","artist_credit":"","primary_artist_id":null,"is_masterless":false}"#;
 
 struct EphemeralPostgres {
     child: Child,
@@ -143,6 +143,11 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
                 (60, 'Numeric appearance release', '2007', NULL),
                 (700, 'Zero sentinel appearance', '2008', 0),
                 (701, 'Compilation appearance child', '', 70);
+            -- Workflow status is deliberately contradictory evidence: the
+            -- artist contract must derive provenance only from format rows.
+            UPDATE release SET status = 'Accepted';
+            UPDATE release SET status = 'Rejected'
+            WHERE id IN (50, 101, 201, 301, 402, 601, 701);
             INSERT INTO release_artist
                 (release_id, artist_id, artist_name, join_relation)
             VALUES
@@ -168,19 +173,19 @@ async fn seed_contract_fixture(pool: &deadpool_postgres::Pool) {
                 (70, 2, 'Guest');
             INSERT INTO release_format (release_id, descriptions) VALUES
                 (101, 'Album, Compilation'),
-                (102, 'Single'),
+                (102, 'Single, Unofficial Release'),
                 (201, 'EP'),
-                (202, 'Single'),
-                (301, 'Compilation'),
-                (501, 'Single'),
+                (202, 'Single, Promo'),
+                (301, 'Compilation, Test Unknown Qualifier'),
+                (501, 'Single, Promo'),
                 (50, 'Album'),
-                (400, 'Single, Single'),
-                (401, 'Mini-Album, Compilation'),
+                (400, 'Single, Unofficial Release, Unofficial Release'),
+                (401, 'Mini-Album, Compilation, Promo'),
                 (402, 'Compilation'),
                 (601, 'EP, Compilation'),
-                (602, 'Single, Promo'),
+                (602, 'Single, Promo, Unofficial Release'),
                 (60, 'Album, Compilation'),
-                (700, 'Single, Unofficial Release'),
+                (700, 'Single, Promo, Unofficial Release'),
                 (701, 'Compilation');
             INSERT INTO release_track_artist
                 (release_id, sequence, artist_id, artist_name)
@@ -265,31 +270,37 @@ fn expected_appearance_rows() -> Vec<Value> {
         json!({
             "id": 60, "title": "Mixed appearance master", "type": "EP",
             "primary_types": ["EP", "Single"],
+            "format_qualifiers": ["Compilation", "Promo", "Unofficial Release"],
+            "provenance": ["ordinary", "promo", "unofficial"],
             "first_release_date": "2005", "artist_credit": "",
             "primary_artist_id": null, "is_masterless": false
         }),
         json!({
             "id": "release-60", "title": "Numeric appearance release", "type": "Album",
             "primary_types": ["Album"],
+            "format_qualifiers": ["Compilation"], "provenance": ["ordinary"],
             "first_release_date": "2007", "artist_credit": "Guest",
             "primary_artist_id": 2, "is_masterless": true
         }),
         json!({
             "id": "release-700", "title": "Zero sentinel appearance", "type": "Single",
             "primary_types": ["Single"],
+            "format_qualifiers": ["Promo", "Unofficial Release"],
+            "provenance": ["promo", "unofficial"],
             "first_release_date": "2008", "artist_credit": "Guest",
             "primary_artist_id": 2, "is_masterless": true
         }),
         json!({
             "id": 70, "title": "Compilation appearance master", "type": "Album",
             "primary_types": [],
+            "format_qualifiers": ["Compilation"], "provenance": ["ordinary"],
             "first_release_date": "", "artist_credit": "Guest",
             "primary_artist_id": 2, "is_masterless": false
         }),
     ]
 }
 
-fn check_appearance_rows(actual: &[Value], expected: &[Value]) -> Result<(), String> {
+fn check_strict_rows(actual: &[Value], expected: &[Value]) -> Result<(), String> {
     if actual.len() != expected.len() {
         return Err(format!(
             "appearance row count differs: actual={}, expected={}",
@@ -320,7 +331,7 @@ fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
         let rows = response_rows(&response);
         assert_eq!(response.total, 4);
         let expected = expected_appearance_rows();
-        check_appearance_rows(&rows, &expected).expect("appearance rows match strict fixture");
+        check_strict_rows(&rows, &expected).expect("appearance rows match strict fixture");
         assert_eq!(
             serde_json::to_string(&response.results[0]).expect("serialize nullable fixture"),
             NULL_PRIMARY_ARTIST_FIXTURE_JSON
@@ -339,6 +350,8 @@ fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
             json!({
                 "id": 60, "title": "Mixed appearance master", "type": "EP",
                 "primary_types": ["EP", "Single"],
+                "format_qualifiers": ["Compilation", "Promo", "Unofficial Release"],
+                "provenance": ["ordinary", "promo", "unofficial"],
                 "first_release_date": "2005", "artist_credit": "",
                 "primary_artist_id": null, "is_masterless": false
             })
@@ -354,6 +367,7 @@ fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
             json!({
                 "id": "release-60", "title": "Numeric appearance release", "type": "Album",
                 "primary_types": ["Album"],
+                "format_qualifiers": ["Compilation"], "provenance": ["ordinary"],
                 "first_release_date": "2007", "artist_credit": "Guest",
                 "primary_artist_id": 2, "is_masterless": true
             })
@@ -369,14 +383,14 @@ fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
         let mut namespace_mutant = rows.clone();
         namespace_mutant[0]["id"] = json!("release-60");
         assert!(
-            check_appearance_rows(&namespace_mutant, &expected).is_err(),
+            check_strict_rows(&namespace_mutant, &expected).is_err(),
             "checker accepted a master/release namespace mutant"
         );
 
         let mut typing_mutant = rows.clone();
         typing_mutant[0]["primary_types"] = json!(["EP"]);
         assert!(
-            check_appearance_rows(&typing_mutant, &expected).is_err(),
+            check_strict_rows(&typing_mutant, &expected).is_err(),
             "checker accepted a child-pressing type-loss mutant"
         );
 
@@ -386,8 +400,30 @@ fn deterministic_appearances_contract_pins_structural_types_and_namespaces() {
             .expect("serialized row is an object")
             .remove("primary_types");
         assert!(
-            check_appearance_rows(&missing_field_mutant, &expected).is_err(),
+            check_strict_rows(&missing_field_mutant, &expected).is_err(),
             "checker accepted a missing additive primary_types field"
+        );
+
+        let mut representative_only_provenance_mutant = rows.clone();
+        representative_only_provenance_mutant[0]["provenance"] = json!(["ordinary"]);
+        assert!(
+            check_strict_rows(&representative_only_provenance_mutant, &expected).is_err(),
+            "checker accepted representative-only master provenance"
+        );
+
+        let mut lost_unknown_qualifier_mutant = rows.clone();
+        lost_unknown_qualifier_mutant[3]["format_qualifiers"] = json!([]);
+        assert!(
+            check_strict_rows(&lost_unknown_qualifier_mutant, &expected).is_err(),
+            "checker accepted a dropped format qualifier"
+        );
+
+        let mut duplicate_qualifier_mutant = rows.clone();
+        duplicate_qualifier_mutant[2]["format_qualifiers"] =
+            json!(["Promo", "Promo", "Unofficial Release"]);
+        assert!(
+            check_strict_rows(&duplicate_qualifier_mutant, &expected).is_err(),
+            "checker accepted a duplicate format qualifier"
         );
     });
 }
@@ -439,54 +475,69 @@ fn deterministic_bulk_contract_preserves_wire_semantics_and_multiplicity() {
                 json!({
                     "id": 10, "title": "Main release wins", "type": "Album",
                     "primary_types": ["Album", "Single"],
+                    "format_qualifiers": ["Compilation", "Unofficial Release"],
+                    "provenance": ["ordinary", "unofficial"],
                     "first_release_date": "1999", "artist_credit": "Target & Guest",
                     "primary_artist_id": 1, "is_masterless": false
                 }),
                 json!({
                     "id": 20, "title": "Fallback tie", "type": "EP",
                     "primary_types": ["EP", "Single"],
+                    "format_qualifiers": ["Promo"],
+                    "provenance": ["ordinary", "promo"],
                     "first_release_date": "2000", "artist_credit": "",
                     "primary_artist_id": null, "is_masterless": false
                 }),
                 json!({
                     "id": 50, "title": "Numeric namespace master", "type": "Single",
                     "primary_types": ["Single"],
+                    "format_qualifiers": ["Promo"], "provenance": ["promo"],
                     "first_release_date": "2001", "artist_credit": "Target",
                     "primary_artist_id": 1, "is_masterless": false
                 }),
                 json!({
                     "id": "release-50", "title": "Numeric namespace release", "type": "Album",
                     "primary_types": ["Album"],
+                    "format_qualifiers": [], "provenance": ["ordinary"],
                     "first_release_date": "2001", "artist_credit": "Target feat. Guest",
                     "primary_artist_id": 1, "is_masterless": true
                 }),
                 json!({
                     "id": "release-400", "title": "Duplicate masterless zero", "type": "Single",
                     "primary_types": ["Single"],
+                    "format_qualifiers": ["Unofficial Release"],
+                    "provenance": ["unofficial"],
                     "first_release_date": "2003", "artist_credit": "Target & Target",
                     "primary_artist_id": 1, "is_masterless": true
                 }),
                 json!({
                     "id": "release-400", "title": "Duplicate masterless zero", "type": "Single",
                     "primary_types": ["Single"],
+                    "format_qualifiers": ["Unofficial Release"],
+                    "provenance": ["unofficial"],
                     "first_release_date": "2003", "artist_credit": "Target & Target",
                     "primary_artist_id": 1, "is_masterless": true
                 }),
                 json!({
                     "id": "release-401", "title": "Mini album masterless null", "type": "EP",
                     "primary_types": ["EP"],
+                    "format_qualifiers": ["Compilation", "Promo"],
+                    "provenance": ["promo"],
                     "first_release_date": "2004", "artist_credit": "Target feat. Guest",
                     "primary_artist_id": 1, "is_masterless": true
                 }),
                 json!({
                     "id": 30, "title": "Compilation only", "type": "Album",
-                    "primary_types": [], "first_release_date": "",
+                    "primary_types": [],
+                    "format_qualifiers": ["Compilation", "Test Unknown Qualifier"],
+                    "provenance": ["ordinary"], "first_release_date": "",
                     "artist_credit": "Target", "primary_artist_id": 1,
                     "is_masterless": false
                 }),
                 json!({
                     "id": "release-402", "title": "Compilation masterless null", "type": "Album",
-                    "primary_types": [], "first_release_date": "",
+                    "primary_types": [], "format_qualifiers": ["Compilation"],
+                    "provenance": ["ordinary"], "first_release_date": "",
                     "artist_credit": "Target", "primary_artist_id": 1,
                     "is_masterless": true
                 }),
@@ -522,6 +573,40 @@ fn deterministic_bulk_contract_preserves_wire_semantics_and_multiplicity() {
             .is_err(),
             "checker accepted a representative-only master type mutant"
         );
+
+        let mut representative_only_provenance_mutant = bulk.clone();
+        let master = representative_only_provenance_mutant
+            .iter_mut()
+            .find(|row| row["id"] == 10)
+            .expect("fixture includes mixed-provenance master");
+        master["provenance"] = json!(["ordinary"]);
+        assert!(
+            check_conserved(
+                &legacy,
+                legacy_total,
+                &representative_only_provenance_mutant,
+                response.total,
+            )
+            .is_err(),
+            "checker accepted representative-only master provenance"
+        );
+
+        let mut duplicated_qualifier_mutant = bulk.clone();
+        let release = duplicated_qualifier_mutant
+            .iter_mut()
+            .find(|row| row["id"] == "release-400")
+            .expect("fixture includes duplicate-qualifier masterless release");
+        release["format_qualifiers"] = json!(["Unofficial Release", "Unofficial Release"]);
+        assert!(
+            check_conserved(
+                &legacy,
+                legacy_total,
+                &duplicated_qualifier_mutant,
+                response.total,
+            )
+            .is_err(),
+            "checker accepted a non-deduplicated format qualifier"
+        );
     });
 }
 
@@ -532,6 +617,8 @@ enum Evidence {
     MiniAlbum,
     Single,
     Compilation,
+    Unofficial,
+    PromoUnofficial,
     Unknown,
 }
 
@@ -543,14 +630,16 @@ impl Evidence {
             Self::MiniAlbum => "Mini-Album, Compilation",
             Self::Single => "Single, Promo",
             Self::Compilation => "Compilation",
-            Self::Unknown => "Box Set, Promo",
+            Self::Unofficial => "Album, Unofficial Release, Unofficial Release",
+            Self::PromoUnofficial => "EP, Promo, Unofficial Release",
+            Self::Unknown => "Box Set, Test Unknown Qualifier",
         }
     }
 
     fn scalar_type(&self) -> &'static str {
         match self {
-            Self::Album | Self::Compilation => "Album",
-            Self::Ep | Self::MiniAlbum => "EP",
+            Self::Album | Self::Compilation | Self::Unofficial => "Album",
+            Self::Ep | Self::MiniAlbum | Self::PromoUnofficial => "EP",
             Self::Single => "Single",
             Self::Unknown => "Other",
         }
@@ -558,8 +647,8 @@ impl Evidence {
 
     fn structural_type(&self) -> Option<&'static str> {
         match self {
-            Self::Album => Some("Album"),
-            Self::Ep | Self::MiniAlbum => Some("EP"),
+            Self::Album | Self::Unofficial => Some("Album"),
+            Self::Ep | Self::MiniAlbum | Self::PromoUnofficial => Some("EP"),
             Self::Single => Some("Single"),
             Self::Compilation | Self::Unknown => None,
         }
@@ -601,6 +690,8 @@ fn evidence_strategy() -> impl Strategy<Value = Evidence> {
         Just(Evidence::MiniAlbum),
         Just(Evidence::Single),
         Just(Evidence::Compilation),
+        Just(Evidence::Unofficial),
+        Just(Evidence::PromoUnofficial),
         Just(Evidence::Unknown),
     ]
 }
@@ -681,7 +772,7 @@ fn generated_world_strategy() -> impl Strategy<Value = GeneratedWorld> {
             masters[0].first_date = "2001".to_string();
             masters[0].second_date = "1999".to_string();
             masters[0].first_evidence = Evidence::Album;
-            masters[0].second_evidence = Evidence::Single;
+            masters[0].second_evidence = Evidence::Unofficial;
             masters[0].credit_second_release = false;
             masters[0].has_master_credit = false;
 
@@ -693,17 +784,17 @@ fn generated_world_strategy() -> impl Strategy<Value = GeneratedWorld> {
             masters[1].credit_second_release = true;
 
             masters[2].first_evidence = Evidence::Compilation;
-            masters[2].second_evidence = Evidence::Unknown;
+            masters[2].second_evidence = Evidence::PromoUnofficial;
 
             masterless[0].zero_sentinel = true;
             masterless[0].duplicate_credits = masterless[0].duplicate_credits.max(2);
             masterless[0].date = "2001".to_string();
-            masterless[0].evidence = vec![Evidence::MiniAlbum];
+            masterless[0].evidence = vec![Evidence::Unofficial];
 
             masterless[1].zero_sentinel = false;
-            masterless[1].evidence = vec![Evidence::Compilation];
+            masterless[1].evidence = vec![Evidence::MiniAlbum, Evidence::Single, Evidence::Unknown];
 
-            masterless[2].evidence = vec![Evidence::Single, Evidence::Album, Evidence::Ep];
+            masterless[2].evidence = vec![Evidence::PromoUnofficial, Evidence::Album, Evidence::Ep];
 
             GeneratedWorld {
                 masters,
@@ -775,10 +866,16 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
             ),
         ] {
             let release_title = format!("Release {release_id}");
+            let workflow_status = if release_id % 2 == 0 {
+                "Accepted"
+            } else {
+                "Rejected"
+            };
             transaction
                 .execute(
-                    "INSERT INTO release (id, title, released, master_id) VALUES ($1, $2, $3, $4)",
-                    &[&release_id, &release_title, date, &id],
+                    "INSERT INTO release (id, title, released, master_id, status)
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[&release_id, &release_title, date, &id, &workflow_status],
                 )
                 .await
                 .expect("insert generated master child");
@@ -849,10 +946,22 @@ async fn seed_generated_world(pool: &deadpool_postgres::Pool, world: &GeneratedW
         let release_id = masterless_release_id(index);
         let title = format!("Masterless {release_id}");
         let master_id = spec.zero_sentinel.then_some(0_i32);
+        let workflow_status = if index % 2 == 0 {
+            "Rejected"
+        } else {
+            "Accepted"
+        };
         transaction
             .execute(
-                "INSERT INTO release (id, title, released, master_id) VALUES ($1, $2, $3, $4)",
-                &[&release_id, &title, &spec.date, &master_id],
+                "INSERT INTO release (id, title, released, master_id, status)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &release_id,
+                    &title,
+                    &spec.date,
+                    &master_id,
+                    &workflow_status,
+                ],
             )
             .await
             .expect("insert generated masterless release");
@@ -951,6 +1060,49 @@ fn structural_types<'a>(evidence: impl IntoIterator<Item = &'a Evidence>) -> Vec
     types.into_iter().collect()
 }
 
+fn format_qualifiers<'a>(evidence: impl IntoIterator<Item = &'a Evidence>) -> Vec<String> {
+    let mut qualifiers = BTreeSet::new();
+    for item in evidence {
+        for description in item.description().split(',').map(str::trim) {
+            if !matches!(description, "Album" | "EP" | "Mini-Album" | "Single") {
+                qualifiers.insert(description.to_string());
+            }
+        }
+    }
+    qualifiers.into_iter().collect()
+}
+
+fn release_provenance<'a>(evidence: impl IntoIterator<Item = &'a Evidence>) -> BTreeSet<String> {
+    let descriptions = evidence
+        .into_iter()
+        .flat_map(|item| item.description().split(',').map(str::trim))
+        .collect::<BTreeSet<_>>();
+    let mut provenance = BTreeSet::new();
+    if descriptions.contains("Promo") {
+        provenance.insert("promo".to_string());
+    }
+    if descriptions.contains("Unofficial Release") {
+        provenance.insert("unofficial".to_string());
+    }
+    if provenance.is_empty() {
+        provenance.insert("ordinary".to_string());
+    }
+    provenance
+}
+
+fn master_provenance(first: &Evidence, second: &Evidence) -> Vec<String> {
+    release_provenance([first])
+        .into_iter()
+        .chain(release_provenance([second]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn masterless_provenance(evidence: &[Evidence]) -> Vec<String> {
+    release_provenance(evidence).into_iter().collect()
+}
+
 fn scalar_type<'a>(evidence: impl IntoIterator<Item = &'a Evidence>) -> &'static str {
     evidence
         .into_iter()
@@ -998,6 +1150,8 @@ fn expected_generated_rows(world: &GeneratedWorld) -> Vec<Value> {
                 "title": format!("Master {id}"),
                 "type": rep.scalar_type(),
                 "primary_types": structural_types([&spec.first_evidence, &spec.second_evidence]),
+                "format_qualifiers": format_qualifiers([&spec.first_evidence, &spec.second_evidence]),
+                "provenance": master_provenance(&spec.first_evidence, &spec.second_evidence),
                 "first_release_date": date.unwrap_or_default(),
                 "artist_credit": artist_credit,
                 "primary_artist_id": primary_artist_id,
@@ -1023,6 +1177,8 @@ fn expected_generated_rows(world: &GeneratedWorld) -> Vec<Value> {
             "title": format!("Masterless {id}"),
             "type": scalar,
             "primary_types": structural_types(&spec.evidence),
+            "format_qualifiers": format_qualifiers(&spec.evidence),
+            "provenance": masterless_provenance(&spec.evidence),
             "first_release_date": date.clone().unwrap_or_default(),
             "artist_credit": artist_credit,
             "primary_artist_id": 1,
@@ -1104,6 +1260,8 @@ fn expected_generated_appearance_rows(world: &GeneratedWorld) -> Vec<Value> {
                 "title": format!("Master {id}"),
                 "type": rep.scalar_type(),
                 "primary_types": structural_types([&spec.first_evidence, &spec.second_evidence]),
+                "format_qualifiers": format_qualifiers([&spec.first_evidence, &spec.second_evidence]),
+                "provenance": master_provenance(&spec.first_evidence, &spec.second_evidence),
                 "first_release_date": date.unwrap_or_default(),
                 "artist_credit": artist_credit,
                 "primary_artist_id": primary_artist_id,
@@ -1132,6 +1290,8 @@ fn expected_generated_appearance_rows(world: &GeneratedWorld) -> Vec<Value> {
                 "title": format!("Masterless {id}"),
                 "type": scalar_type(&spec.evidence),
                 "primary_types": structural_types(&spec.evidence),
+                "format_qualifiers": format_qualifiers(&spec.evidence),
+                "provenance": masterless_provenance(&spec.evidence),
                 "first_release_date": date.unwrap_or_default(),
                 "artist_credit": artist_credit,
                 "primary_artist_id": 1,
@@ -1170,6 +1330,8 @@ fn expected_master_only_appearance(world: &GeneratedWorld) -> Value {
         "title": format!("Master {}", master_id(0)),
         "type": spec.first_evidence.scalar_type(),
         "primary_types": structural_types([&spec.first_evidence, &spec.second_evidence]),
+        "format_qualifiers": format_qualifiers([&spec.first_evidence, &spec.second_evidence]),
+        "provenance": master_provenance(&spec.first_evidence, &spec.second_evidence),
         "first_release_date": spec.first_date,
         "artist_credit": artist_credit,
         "primary_artist_id": primary_artist_id,
@@ -1197,7 +1359,8 @@ fn generated_artist_queries_match_real_sql_contracts() {
                 let bulk = response_rows(&response);
                 check_conserved(&legacy, legacy_total, &bulk, response.total)
                     .map_err(TestCaseError::fail)?;
-                prop_assert_eq!(bulk, expected_generated_rows(&world));
+                let expected_bulk = expected_generated_rows(&world);
+                check_strict_rows(&bulk, &expected_bulk).map_err(TestCaseError::fail)?;
 
                 let appearances = db::query_artist_appearances(&pool, 3)
                     .await
@@ -1207,7 +1370,7 @@ fn generated_artist_queries_match_real_sql_contracts() {
                     })?;
                 let appearance_rows = response_rows(&appearances);
                 let expected_appearances = expected_generated_appearance_rows(&world);
-                check_appearance_rows(&appearance_rows, &expected_appearances)
+                check_strict_rows(&appearance_rows, &expected_appearances)
                     .map_err(TestCaseError::fail)?;
                 prop_assert_eq!(appearances.total as usize, appearance_rows.len());
 

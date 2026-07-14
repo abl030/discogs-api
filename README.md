@@ -39,15 +39,31 @@ rollout window. Recursive sub-label rollups use a 15 second PostgreSQL
 `statement_timeout`; timeout and pool-saturation failures return HTTP 503 with
 `{"error":"timeout","label_id":...}` or `{"error":"pool_unavailable","label_id":...}`.
 
-Artist master and appearance rows retain the legacy scalar `type` and also
-include `primary_types`, a sorted, deduplicated list of recognized structural
-types (`Album`, `EP`, `Single`). For a master this list aggregates format
-descriptions across every child pressing; for a masterless entry it reflects
-only that exact release. An empty list means the available Discogs descriptions
-do not identify a recognized structural type. `Compilation` is treated as a
-qualifier rather than structural type evidence, so a compilation-only entry is
-unknown; literal `Album`, `EP`, or `Single` descriptions still count when they
-appear alongside it.
+Artist master and appearance rows retain the legacy scalar `type` and expose
+three additive evidence fields:
+
+- `primary_types` is the sorted, deduplicated set of recognized structural
+  types (`Album`, `EP`, `Single`). `Mini-Album` normalizes to `EP`.
+- `format_qualifiers` is the sorted, deduplicated set of every non-structural
+  Discogs format description. Known qualifiers such as `Compilation`, `Promo`,
+  and `Unofficial Release` are retained alongside unknown descriptions rather
+  than collapsed into a fixed vocabulary.
+- `provenance` is a sorted, deduplicated set whose possible values are
+  `ordinary`, `promo`, and `unofficial`. Each represented release contributes
+  `promo` when it has the `Promo` qualifier, `unofficial` when it has the
+  `Unofficial Release` qualifier, and `ordinary` only when it has neither. A
+  release carrying both exceptional qualifiers contributes both and does not
+  contribute `ordinary`.
+
+For a master, all three fields aggregate across **every child pressing**, not
+only the representative or artist-credited pressing. Mixed masters therefore
+retain multiple provenance values, such as `["ordinary", "unofficial"]`. For a
+masterless row, evidence is scoped to that exact release. The existing
+`is_masterless` field distinguishes these identities. The import workflow's
+`release.status` value (for example `Accepted`) is never treated as provenance
+evidence. An empty structural set means no represented description identifies
+an Album, EP, or Single; for example, a compilation-only row has
+`primary_types: []` and `format_qualifiers: ["Compilation"]`.
 
 The paginated artist-masters route remains compatible for existing clients.
 Bulk consumers should use the explicit `/masters/all` path instead of a large

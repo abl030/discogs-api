@@ -1249,10 +1249,10 @@ async fn enrich_artist_master_projection(
     }
 
     // Keep the legacy scalar based on the representative release, while the
-    // additive structural set covers every pressing represented by each row.
+    // additive evidence fields cover every pressing represented by each row.
     let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
-    let primary_type_maps =
-        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
+    let evidence_maps =
+        fetch_artist_entry_evidence(client, &master_ids, &masterless_release_ids).await?;
     let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
     let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
 
@@ -1264,9 +1264,9 @@ async fn enrich_artist_master_projection(
                 .cloned()
                 .unwrap_or_default();
             let primary_type = infer_primary_type(&descriptions);
-            let (primary_types, pairs) = match row.kind {
+            let (evidence, pairs) = match row.kind {
                 ArtistMasterProjectionKind::Master => (
-                    primary_type_maps
+                    evidence_maps
                         .masters
                         .get(&row.entry_id)
                         .cloned()
@@ -1277,7 +1277,7 @@ async fn enrich_artist_master_projection(
                         .unwrap_or_default(),
                 ),
                 ArtistMasterProjectionKind::MasterlessRelease => (
-                    primary_type_maps
+                    evidence_maps
                         .masterless_releases
                         .get(&row.entry_id)
                         .cloned()
@@ -1306,7 +1306,9 @@ async fn enrich_artist_master_projection(
                 id,
                 title: row.title.clone(),
                 type_: primary_type,
-                primary_types,
+                primary_types: evidence.primary_types,
+                format_qualifiers: evidence.format_qualifiers,
+                provenance: evidence.provenance,
                 first_release_date: row.first_release_date.clone(),
                 artist_credit,
                 primary_artist_id,
@@ -1489,8 +1491,8 @@ pub async fn query_artist_appearances(
     }
 
     let fmt_map = fetch_format_descriptions(client, &rep_release_ids).await?;
-    let primary_type_maps =
-        fetch_artist_entry_primary_types(client, &master_ids, &masterless_release_ids).await?;
+    let evidence_maps =
+        fetch_artist_entry_evidence(client, &master_ids, &masterless_release_ids).await?;
     let master_credit_map = fetch_master_artist_credits(client, &master_ids).await?;
     let release_credit_map = fetch_release_artist_credits(client, &masterless_release_ids).await?;
 
@@ -1505,14 +1507,14 @@ pub async fn query_artist_appearances(
 
             let descriptions = fmt_map.get(&rep).cloned().unwrap_or_default();
             let primary_type = infer_primary_type(&descriptions);
-            let primary_types = if kind == "master" {
-                primary_type_maps
+            let evidence = if kind == "master" {
+                evidence_maps
                     .masters
                     .get(&entry_id)
                     .cloned()
                     .unwrap_or_default()
             } else {
-                primary_type_maps
+                evidence_maps
                     .masterless_releases
                     .get(&entry_id)
                     .cloned()
@@ -1552,7 +1554,9 @@ pub async fn query_artist_appearances(
                 id: id_value,
                 title,
                 type_: primary_type,
-                primary_types,
+                primary_types: evidence.primary_types,
+                format_qualifiers: evidence.format_qualifiers,
+                provenance: evidence.provenance,
                 first_release_date,
                 artist_credit: credit_str,
                 primary_artist_id: primary_artist,
@@ -1949,44 +1953,54 @@ enum ArtistEntryKind {
 struct ArtistEntryFormatDescription {
     kind: ArtistEntryKind,
     entry_id: i32,
-    descriptions: String,
+    release_id: i32,
+    descriptions: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ArtistEntryEvidence {
+    primary_types: Vec<String>,
+    format_qualifiers: Vec<String>,
+    provenance: Vec<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ArtistEntryPrimaryTypeMaps {
-    masters: HashMap<i32, Vec<String>>,
-    masterless_releases: HashMap<i32, Vec<String>>,
+struct ArtistEntryEvidenceMaps {
+    masters: HashMap<i32, ArtistEntryEvidence>,
+    masterless_releases: HashMap<i32, ArtistEntryEvidence>,
 }
 
-/// Fetch structural type evidence for one artist endpoint result set.
+/// Fetch structural, qualifier, and provenance evidence for one artist result.
 ///
-/// Masters aggregate format descriptions across every child release, while
-/// masterless entries use only their exact release. Both groups are fetched in
-/// a single page-level query so endpoint cost does not grow by one query per
-/// result row.
-async fn fetch_artist_entry_primary_types(
+/// Masters aggregate every child pressing, including children that were not
+/// used to select or represent the artist row. Masterless entries use only
+/// their exact release. Both groups are fetched in one page-level query.
+async fn fetch_artist_entry_evidence(
     client: &Client,
     master_ids: &[i32],
     masterless_release_ids: &[i32],
-) -> anyhow::Result<ArtistEntryPrimaryTypeMaps> {
+) -> anyhow::Result<ArtistEntryEvidenceMaps> {
     if master_ids.is_empty() && masterless_release_ids.is_empty() {
-        return Ok(ArtistEntryPrimaryTypeMaps::default());
+        return Ok(ArtistEntryEvidenceMaps::default());
     }
 
     let rows = client
         .query(
             "SELECT 'master'::text AS kind,
                     r.master_id AS entry_id,
+                    r.id AS release_id,
                     rf.descriptions
              FROM release r
-             JOIN release_format rf ON rf.release_id = r.id
+             LEFT JOIN release_format rf ON rf.release_id = r.id
              WHERE r.master_id = ANY($1)
              UNION ALL
              SELECT 'release'::text AS kind,
-                    rf.release_id AS entry_id,
+                    r.id AS entry_id,
+                    r.id AS release_id,
                     rf.descriptions
-             FROM release_format rf
-             WHERE rf.release_id = ANY($2)",
+             FROM release r
+             LEFT JOIN release_format rf ON rf.release_id = r.id
+             WHERE r.id = ANY($2)",
             &[&master_ids, &masterless_release_ids],
         )
         .await?;
@@ -2002,41 +2016,94 @@ async fn fetch_artist_entry_primary_types(
                     ArtistEntryKind::MasterlessRelease
                 },
                 entry_id: row.get("entry_id"),
+                release_id: row.get("release_id"),
                 descriptions: row.get("descriptions"),
             }
         })
         .collect();
 
-    Ok(group_artist_entry_primary_types(&descriptions))
+    Ok(group_artist_entry_evidence(&descriptions))
 }
 
-fn group_artist_entry_primary_types(
+fn group_artist_entry_evidence(
     descriptions: &[ArtistEntryFormatDescription],
-) -> ArtistEntryPrimaryTypeMaps {
-    let mut master_types: HashMap<i32, BTreeSet<String>> = HashMap::new();
-    let mut masterless_release_types: HashMap<i32, BTreeSet<String>> = HashMap::new();
+) -> ArtistEntryEvidenceMaps {
+    let mut master_releases: HashMap<i32, HashMap<i32, BTreeSet<String>>> = HashMap::new();
+    let mut masterless_releases: HashMap<i32, HashMap<i32, BTreeSet<String>>> = HashMap::new();
 
     for description in descriptions {
-        let types = match description.kind {
-            ArtistEntryKind::Master => master_types.entry(description.entry_id).or_default(),
-            ArtistEntryKind::MasterlessRelease => masterless_release_types
-                .entry(description.entry_id)
-                .or_default(),
+        let releases = match description.kind {
+            ArtistEntryKind::Master => master_releases.entry(description.entry_id).or_default(),
+            ArtistEntryKind::MasterlessRelease => {
+                masterless_releases.entry(description.entry_id).or_default()
+            }
         };
-        types.extend(structural_primary_types(std::slice::from_ref(
-            &description.descriptions,
-        )));
+        let tokens = releases.entry(description.release_id).or_default();
+        if let Some(descriptions) = &description.descriptions {
+            tokens.extend(
+                descriptions
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_string),
+            );
+        }
     }
 
-    ArtistEntryPrimaryTypeMaps {
-        masters: master_types
+    ArtistEntryEvidenceMaps {
+        masters: master_releases
             .into_iter()
-            .map(|(id, types)| (id, types.into_iter().collect()))
+            .map(|(id, releases)| (id, summarize_artist_entry_evidence(releases)))
             .collect(),
-        masterless_releases: masterless_release_types
+        masterless_releases: masterless_releases
             .into_iter()
-            .map(|(id, types)| (id, types.into_iter().collect()))
+            .map(|(id, releases)| (id, summarize_artist_entry_evidence(releases)))
             .collect(),
+    }
+}
+
+fn summarize_artist_entry_evidence(
+    releases: HashMap<i32, BTreeSet<String>>,
+) -> ArtistEntryEvidence {
+    let mut primary_types = BTreeSet::new();
+    let mut format_qualifiers = BTreeSet::new();
+    let mut provenance = BTreeSet::new();
+
+    for descriptions in releases.into_values() {
+        let is_promo = descriptions.contains("Promo");
+        let is_unofficial = descriptions.contains("Unofficial Release");
+        if is_promo {
+            provenance.insert("promo".to_string());
+        }
+        if is_unofficial {
+            provenance.insert("unofficial".to_string());
+        }
+        if !is_promo && !is_unofficial {
+            provenance.insert("ordinary".to_string());
+        }
+
+        for description in descriptions {
+            match description.as_str() {
+                "Album" => {
+                    primary_types.insert("Album".to_string());
+                }
+                "EP" | "Mini-Album" => {
+                    primary_types.insert("EP".to_string());
+                }
+                "Single" => {
+                    primary_types.insert("Single".to_string());
+                }
+                _ => {
+                    format_qualifiers.insert(description);
+                }
+            }
+        }
+    }
+
+    ArtistEntryEvidence {
+        primary_types: primary_types.into_iter().collect(),
+        format_qualifiers: format_qualifiers.into_iter().collect(),
+        provenance: provenance.into_iter().collect(),
     }
 }
 
@@ -2124,105 +2191,83 @@ fn infer_primary_type(description_rows: &[String]) -> String {
     "Other".to_string()
 }
 
-fn structural_primary_types(description_rows: &[String]) -> Vec<String> {
-    let mut types = BTreeSet::new();
-    for row in description_rows {
-        for description in row.split(',').map(str::trim) {
-            let normalized = match description {
-                "Album" => Some("Album"),
-                "EP" | "Mini-Album" => Some("EP"),
-                "Single" => Some("Single"),
-                _ => None,
-            };
-            if let Some(primary_type) = normalized {
-                types.insert(primary_type.to_string());
-            }
-        }
-    }
-    types.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtistEntryFormatDescription, ArtistEntryKind, group_artist_entry_primary_types,
-        structural_primary_types,
+        ArtistEntryEvidence, ArtistEntryFormatDescription, ArtistEntryKind,
+        group_artist_entry_evidence,
     };
 
     #[test]
-    fn structural_primary_types_normalize_recognized_discogs_descriptions() {
-        let descriptions = vec![
-            "Album, Compilation".to_string(),
-            "EP, Compilation".to_string(),
-            "Mini-Album, Compilation".to_string(),
-            "Single, Compilation".to_string(),
-            "Unofficial Release, Promo".to_string(),
-        ];
-
-        assert_eq!(
-            structural_primary_types(&descriptions),
-            vec!["Album", "EP", "Single"]
-        );
-        assert!(structural_primary_types(&["Compilation".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn structural_primary_types_are_sorted_deduplicated_and_exclude_unknowns() {
-        let descriptions = vec![
-            "Single, Album, Single".to_string(),
-            "EP, Compilation, Mini-Album".to_string(),
-            "Box Set".to_string(),
-        ];
-
-        assert_eq!(
-            structural_primary_types(&descriptions),
-            vec!["Album", "EP", "Single"]
-        );
-        assert!(structural_primary_types(&["Box Set, Promo".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn groups_all_master_children_but_scopes_masterless_types_to_exact_releases() {
+    fn groups_release_level_provenance_and_all_non_structural_qualifiers() {
         let descriptions = vec![
             ArtistEntryFormatDescription {
                 kind: ArtistEntryKind::Master,
                 entry_id: 10,
-                descriptions: "Single, Compilation".to_string(),
+                release_id: 100,
+                descriptions: Some("Album, Compilation".to_string()),
             },
             ArtistEntryFormatDescription {
                 kind: ArtistEntryKind::Master,
                 entry_id: 10,
-                descriptions: "EP, Mini-Album, EP".to_string(),
+                release_id: 101,
+                descriptions: Some("Single, Promo, Test Unknown Qualifier".to_string()),
+            },
+            ArtistEntryFormatDescription {
+                kind: ArtistEntryKind::Master,
+                entry_id: 10,
+                release_id: 102,
+                descriptions: Some("EP, Unofficial Release, Unofficial Release".to_string()),
+            },
+            ArtistEntryFormatDescription {
+                kind: ArtistEntryKind::MasterlessRelease,
+                entry_id: 10,
+                release_id: 10,
+                descriptions: Some("Mini-Album, Promo, Unofficial Release".to_string()),
             },
             ArtistEntryFormatDescription {
                 kind: ArtistEntryKind::Master,
                 entry_id: 11,
-                descriptions: "Compilation".to_string(),
-            },
-            ArtistEntryFormatDescription {
-                kind: ArtistEntryKind::MasterlessRelease,
-                entry_id: 10,
-                descriptions: "Album, Album".to_string(),
-            },
-            ArtistEntryFormatDescription {
-                kind: ArtistEntryKind::MasterlessRelease,
-                entry_id: 20,
-                descriptions: "Single".to_string(),
-            },
-            ArtistEntryFormatDescription {
-                kind: ArtistEntryKind::MasterlessRelease,
-                entry_id: 21,
-                descriptions: "EP".to_string(),
+                release_id: 110,
+                descriptions: None,
             },
         ];
 
-        let grouped = group_artist_entry_primary_types(&descriptions);
+        let grouped = group_artist_entry_evidence(&descriptions);
 
-        assert_eq!(grouped.masters[&10], vec!["EP", "Single"]);
-        assert!(grouped.masters[&11].is_empty());
-        assert_eq!(grouped.masterless_releases[&10], vec!["Album"]);
-        assert_eq!(grouped.masterless_releases[&20], vec!["Single"]);
-        assert_eq!(grouped.masterless_releases[&21], vec!["EP"]);
+        assert_eq!(
+            grouped.masters[&10],
+            ArtistEntryEvidence {
+                primary_types: vec!["Album".to_string(), "EP".to_string(), "Single".to_string()],
+                format_qualifiers: vec![
+                    "Compilation".to_string(),
+                    "Promo".to_string(),
+                    "Test Unknown Qualifier".to_string(),
+                    "Unofficial Release".to_string(),
+                ],
+                provenance: vec![
+                    "ordinary".to_string(),
+                    "promo".to_string(),
+                    "unofficial".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            grouped.masterless_releases[&10],
+            ArtistEntryEvidence {
+                primary_types: vec!["EP".to_string()],
+                format_qualifiers: vec!["Promo".to_string(), "Unofficial Release".to_string()],
+                provenance: vec!["promo".to_string(), "unofficial".to_string()],
+            }
+        );
+        assert_eq!(
+            grouped.masters[&11],
+            ArtistEntryEvidence {
+                primary_types: vec![],
+                format_qualifiers: vec![],
+                provenance: vec!["ordinary".to_string()],
+            }
+        );
     }
 }
 
