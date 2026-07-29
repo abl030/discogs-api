@@ -122,7 +122,11 @@ Produces two binaries in `target/release/`: `discogs-import` and `discogs-api`.
 
 ## Running
 
-Both binaries need a PostgreSQL database and take a `--dsn` connection string.
+Both binaries need a PostgreSQL database, a passwordless `--dsn`, and a
+root/private `--credential-file` containing a literal `PGPASSWORD=...` line.
+The file is dotenv-compatible, but the value is not expanded from the process
+environment and must not use shell/dotenv quoting. Password-bearing DSNs are
+rejected before any network activity.
 
 ### Importer
 
@@ -131,7 +135,10 @@ Both binaries need a PostgreSQL database and take a `--dsn` connection string.
 createdb discogs
 
 # Run the importer (downloads ~12 GB, imports ~19M releases)
-./discogs-import --dsn 'postgresql://user@localhost:5432/discogs' --dump-dir ./dumps
+./discogs-import \
+  --dsn 'postgresql://user@localhost:5432/discogs' \
+  --credential-file /run/credentials/discogs/postgres-password \
+  --dump-dir ./dumps
 ```
 
 The importer will:
@@ -148,7 +155,10 @@ Full import takes ~15-20 minutes on reasonable hardware. Progress is logged ever
 ### API Server
 
 ```bash
-./discogs-api --dsn 'postgresql://user@localhost:5432/discogs' --port 8086
+./discogs-api \
+  --dsn 'postgresql://user@localhost:5432/discogs' \
+  --credential-file /run/credentials/discogs/postgres-password \
+  --port 8086
 ```
 
 The server starts immediately and serves on the given port. It works before the first import (returns `{"status":"awaiting_import","releases":0,...}`).
@@ -214,15 +224,17 @@ sudo -u postgres createdb -O discogs discogs
 # 3. Import
 ./target/release/discogs-import \
   --dsn 'postgresql://discogs@localhost:5432/discogs' \
+  --credential-file /run/credentials/discogs/postgres-password \
   --dump-dir /var/lib/discogs/dumps
 
 # 4. Run the API
 ./target/release/discogs-api \
   --dsn 'postgresql://discogs@localhost:5432/discogs' \
+  --credential-file /run/credentials/discogs/postgres-password \
   --port 8086
 
 # 5. (Optional) Cron for monthly re-import
-# 0 4 2 * * /usr/local/bin/discogs-import --dsn '...' --dump-dir /var/lib/discogs/dumps
+# 0 4 2 * * /usr/local/bin/discogs-import --dsn '...' --credential-file /run/credentials/discogs/postgres-password --dump-dir /var/lib/discogs/dumps
 ```
 
 ## Repo Structure
