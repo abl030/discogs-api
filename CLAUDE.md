@@ -35,7 +35,7 @@ be on `PATH` for every `cargo test`; tests never skip or fall back to a live DB.
 
 ## Infrastructure
 
-Pure application code — no infrastructure awareness. Takes `--dsn` and `--dump-dir` / `--port` as CLI args.
+Pure application code — no infrastructure awareness. Both binaries take a passwordless `--dsn`, a private dotenv-compatible `--credential-file` containing a literal `PGPASSWORD=...` line, and `--dump-dir` / `--port`. Password-bearing DSNs are rejected before network activity; credential values never expand the process environment.
 
 - **Postgres**: nspawn container `discogs-db` on doc2, reachable at `10.20.0.13:5432` (the live nspawn-bridge address the service connects over; `machinectl list` confirms it). The host-namespace address `192.168.100.13` times out.
 - **DSN**: `postgresql://discogs@10.20.0.13:5432/discogs`

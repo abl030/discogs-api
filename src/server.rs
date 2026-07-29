@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -19,6 +20,10 @@ struct Args {
     #[arg(long)]
     dsn: String,
 
+    /// Root-only file containing a literal PGPASSWORD=... line
+    #[arg(long)]
+    credential_file: PathBuf,
+
     /// Port to listen on
     #[arg(long, default_value = "8086")]
     port: u16,
@@ -33,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let pool = db::create_pool(&args.dsn).await?;
+    let pool = db::create_pool_with_credential(&args.dsn, &args.credential_file).await?;
     let state = Arc::new(AppState { pool });
 
     let app = Router::new()

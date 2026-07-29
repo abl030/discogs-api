@@ -1,5 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::pin::pin;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -70,8 +73,39 @@ fn label_releases_query_error(err: tokio_postgres::Error) -> anyhow::Error {
 // Connection
 // ---------------------------------------------------------------------------
 
-pub async fn connect(dsn: &str) -> anyhow::Result<Client> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
+pub fn connection_config(
+    dsn: &str,
+    credential_file: &Path,
+) -> anyhow::Result<tokio_postgres::Config> {
+    let mut config = tokio_postgres::Config::from_str(dsn)?;
+    anyhow::ensure!(
+        config.get_password().is_none(),
+        "PostgreSQL DSN must not contain a password"
+    );
+
+    let file = File::open(credential_file)?;
+    let mut password = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|_| anyhow::anyhow!("Invalid PostgreSQL credential file"))?;
+        let Some(value) = line.strip_prefix("PGPASSWORD=") else {
+            continue;
+        };
+        anyhow::ensure!(password.is_none(), "Invalid PostgreSQL credential file");
+        anyhow::ensure!(
+            !value.starts_with(['\'', '"']) && !value.chars().any(char::is_control),
+            "Invalid PostgreSQL credential file"
+        );
+        password = Some(value.to_owned());
+    }
+    let password = password
+        .ok_or_else(|| anyhow::anyhow!("PostgreSQL credential file is missing PGPASSWORD"))?;
+    anyhow::ensure!(!password.is_empty(), "PGPASSWORD must not be empty");
+    config.password(password);
+    Ok(config)
+}
+
+async fn connect_config(config: tokio_postgres::Config) -> anyhow::Result<Client> {
+    let (client, connection) = config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::error!("postgres connection error: {e}");
@@ -80,8 +114,15 @@ pub async fn connect(dsn: &str) -> anyhow::Result<Client> {
     Ok(client)
 }
 
-pub async fn create_pool(dsn: &str) -> anyhow::Result<Pool> {
-    let mut pg_config = tokio_postgres::Config::from_str(dsn)?;
+pub async fn connect(dsn: &str) -> anyhow::Result<Client> {
+    connect_config(tokio_postgres::Config::from_str(dsn)?).await
+}
+
+pub async fn connect_with_credential(dsn: &str, credential_file: &Path) -> anyhow::Result<Client> {
+    connect_config(connection_config(dsn, credential_file)?).await
+}
+
+async fn create_pool_config(mut pg_config: tokio_postgres::Config) -> anyhow::Result<Pool> {
     pg_config.connect_timeout(Duration::from_secs(5));
     let manager = Manager::from_config(
         pg_config,
@@ -104,6 +145,17 @@ pub async fn create_pool(dsn: &str) -> anyhow::Result<Pool> {
     drop(client);
 
     Ok(pool)
+}
+
+pub async fn create_pool(dsn: &str) -> anyhow::Result<Pool> {
+    create_pool_config(tokio_postgres::Config::from_str(dsn)?).await
+}
+
+pub async fn create_pool_with_credential(
+    dsn: &str,
+    credential_file: &Path,
+) -> anyhow::Result<Pool> {
+    create_pool_config(connection_config(dsn, credential_file)?).await
 }
 
 // ---------------------------------------------------------------------------

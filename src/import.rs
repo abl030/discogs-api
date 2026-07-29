@@ -15,6 +15,10 @@ struct Args {
     #[arg(long)]
     dsn: String,
 
+    /// Root-only file containing a literal PGPASSWORD=... line
+    #[arg(long)]
+    credential_file: PathBuf,
+
     /// Directory to store downloaded XML dump files
     #[arg(long)]
     dump_dir: PathBuf,
@@ -38,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Connect and init schema
-    let client = db::connect(&args.dsn).await?;
+    let client = db::connect_with_credential(&args.dsn, &args.credential_file).await?;
     db::init_schema(&client).await?;
 
     // Import each entity type
