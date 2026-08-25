@@ -2381,6 +2381,30 @@ fn parse_descriptions(s: &str) -> Vec<String> {
     }
 }
 
+/// True when at least one tracklist row carries a non-empty position.
+///
+/// Guard for [`discogs_track_type`]: a fully positionless tracklist has no
+/// heading signal, so without this every row of such a release would be
+/// misread as a heading candidate.
+fn tracklist_has_positioned_row<'a>(positions: impl IntoIterator<Item = &'a str>) -> bool {
+    positions.into_iter().any(|p| !p.is_empty())
+}
+
+/// Infer the Discogs `type_` for one tracklist row of the compat surface.
+///
+/// The XML dumps carry no per-track type field, but the real
+/// api.discogs.com serves section headings as `"heading"`. A row is a
+/// heading iff its position AND duration are both literally empty and the
+/// release has at least one positioned row; everything else stays
+/// `"track"`.
+fn discogs_track_type(position: &str, duration: &str, has_positioned_row: bool) -> &'static str {
+    if has_positioned_row && position.is_empty() && duration.is_empty() {
+        "heading"
+    } else {
+        "track"
+    }
+}
+
 pub async fn query_discogs_release(pool: &Pool, id: i32) -> anyhow::Result<Option<DiscogsRelease>> {
     let client = get_client(pool).await?;
     let client = &**client;
@@ -2470,15 +2494,20 @@ pub async fn query_discogs_release(pool: &Pool, id: i32) -> anyhow::Result<Optio
             });
     }
 
+    let has_positioned_row =
+        tracklist_has_positioned_row(track_rows.iter().map(|r| r.get::<_, &str>("position")));
+
     let tracklist: Vec<DiscogsTrack> = track_rows
         .iter()
         .map(|r| {
             let seq: i32 = r.get("sequence");
+            let position: String = r.get("position");
+            let duration: String = r.get("duration");
             DiscogsTrack {
-                position: r.get("position"),
-                type_: "track".to_string(),
+                type_: discogs_track_type(&position, &duration, has_positioned_row).to_string(),
+                position,
                 title: r.get("title"),
-                duration: r.get("duration"),
+                duration,
                 artists: track_artist_map.remove(&seq).unwrap_or_default(),
                 extraartists: vec![],
             }
@@ -2667,4 +2696,76 @@ async fn fetch_release_enrichments(
     }
 
     Ok((artist_map, label_map, format_map))
+}
+
+#[cfg(test)]
+mod track_type_tests {
+    use super::{discogs_track_type, tracklist_has_positioned_row};
+
+    /// Map a whole tracklist of (position, duration) pairs through the same
+    /// two functions the `/releases/{id}` serve path composes.
+    fn types_for(rows: &[(&str, &str)]) -> Vec<&'static str> {
+        let has_positioned = tracklist_has_positioned_row(rows.iter().map(|(p, _)| *p));
+        rows.iter()
+            .map(|(p, d)| discogs_track_type(p, d, has_positioned))
+            .collect()
+    }
+
+    /// La Dispute — Tiny Dots (release 8439330): 14 rows, where rows 1 and 8
+    /// (1-based) are section labels with empty position AND empty duration.
+    /// The real api.discogs.com types exactly those two as "heading".
+    #[test]
+    fn test_tiny_dots_heading_rows_are_headings() {
+        let rows: Vec<(&str, &str)> = vec![
+            ("", ""), // "Selections From \"Tiny Dots\" Original Score"
+            ("1", "2:41"),
+            ("2", "3:12"),
+            ("3", "1:58"),
+            ("4", "4:05"),
+            ("5", "2:27"),
+            ("6", "3:44"),
+            ("", ""), // "Selections From Live Seated Performance May 24, 2014 Kingston, UK"
+            ("7", "4:18"),
+            ("8", "3:02"),
+            ("9", "5:11"),
+            ("10", "3:37"),
+            ("11", "4:52"),
+            ("12", "6:09"),
+        ];
+        let types = types_for(&rows);
+        for (i, t) in types.iter().enumerate() {
+            let expected = if i == 0 || i == 7 { "heading" } else { "track" };
+            assert_eq!(*t, expected, "row {i} should be {expected}");
+        }
+    }
+
+    #[test]
+    fn test_positioned_timed_row_is_track() {
+        assert_eq!(discogs_track_type("A1", "4:33", true), "track");
+    }
+
+    #[test]
+    fn test_untimed_but_positioned_row_is_track() {
+        assert_eq!(discogs_track_type("A2", "", true), "track");
+    }
+
+    #[test]
+    fn test_unpositioned_but_timed_row_is_track() {
+        assert_eq!(discogs_track_type("", "3:10", true), "track");
+    }
+
+    /// A fully positionless tracklist has no heading signal — every row stays
+    /// "track", even ones with empty position and duration.
+    #[test]
+    fn test_positionless_only_tracklist_stays_all_track() {
+        let rows: Vec<(&str, &str)> = vec![("", ""), ("", "3:00"), ("", "")];
+        assert_eq!(types_for(&rows), vec!["track", "track", "track"]);
+    }
+
+    #[test]
+    fn test_has_positioned_row_detection() {
+        assert!(tracklist_has_positioned_row(["", "1", ""]));
+        assert!(!tracklist_has_positioned_row(["", "", ""]));
+        assert!(!tracklist_has_positioned_row(std::iter::empty::<&str>()));
+    }
 }
