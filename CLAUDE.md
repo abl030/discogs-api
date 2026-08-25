@@ -37,10 +37,10 @@ be on `PATH` for every `cargo test`; tests never skip or fall back to a live DB.
 
 Pure application code — no infrastructure awareness. Both binaries take a passwordless `--dsn`, a private dotenv-compatible `--credential-file` containing a literal `PGPASSWORD=...` line, and `--dump-dir` / `--port`. Password-bearing DSNs are rejected before network activity; credential values never expand the process environment.
 
-- **Postgres**: nspawn container `discogs-db` on doc2, reachable at `10.20.0.13:5432` (the live nspawn-bridge address the service connects over; `machinectl list` confirms it). The host-namespace address `192.168.100.13` times out.
-- **DSN**: `postgresql://discogs@10.20.0.13:5432/discogs`
-- **API**: `discogs.ablz.au` (port 8086, behind localProxy with auto ACME)
-- **Data**: `/mnt/mirrors/discogs` on doc2 (re-downloadable, not backed up)
+- **Host**: the `discogs` LXC at `192.168.1.44` (moved off doc2). `homelab.services.discogs` in `nixosconfig/hosts/discogs/configuration-lxc.nix` with `databaseMode = "native"`.
+- **Postgres**: native `postgresql.service` on the LXC, data in `/var/lib/discogs-postgresql` (a verified ZFS dataset mount).
+- **API**: `discogs.ablz.au` (port 8086 on the LXC, behind localProxy with auto ACME); Cratedigger consumers hit `192.168.1.44:8086` directly.
+- **Data**: `/var/lib/discogs-mirror` on the LXC (re-downloadable, not backed up)
 - **NixOS module**: `nixosconfig/modules/nixos/services/discogs.nix`
 - **Flake input**: `discogs-src` in nixosconfig's flake.nix (non-flake, `github:abl030/discogs-api`)
 
@@ -49,37 +49,48 @@ Pure application code — no infrastructure awareness. Both binaries take a pass
 Deploy from proxmox-vm/doc1 (where this repo lives, and which holds the Forgejo
 token + SSH signing key).
 
-**Since the 2026-06-10 Forgejo cutover, the nixosconfig leg goes through Forgejo
-(`git.ablz.au`) + `fleet-update`, NOT `github:abl030/nixosconfig`.** GitHub's
-nixosconfig is a frozen, stale fallback. This repo itself still pushes to GitHub;
-only the nixosconfig leg changed.
+**The service runs on the `discogs` LXC, which has NO `nixos-upgrade.service`
+and password-only sudo — `fleet-deploy discogs` and `ssh discogs sudo
+fleet-update` do NOT work.** It deploys via **push-deploy** (forgejo#10,
+`nixosconfig/modules/nixos/autoupdate/push-deploy.nix`): doc1 builds the
+closure locally and hands the store path to a root forced-command key on the
+LXC, which realises it from nixcache.ablz.au (nix-serve over doc1's live
+store) and switches. The nixosconfig leg goes through Forgejo (`git.ablz.au`);
+GitHub's nixosconfig is a frozen, stale fallback. This repo itself still
+pushes to GitHub.
 
 ```bash
-git push                                          # this repo → GitHub (unchanged)
-cd ~/nixosconfig && git pull && nix flake update discogs-src && git add flake.lock \
-  && git commit -m "discogs: description"         # commit must be SSH-signed (commit.gpgsign is on)
-TOKEN=$(cat /run/secrets/forgejo/nixbot-token) \
-  && git -c "http.extraHeader=Authorization: token ${TOKEN}" push origin master   # never echo the token
-ssh doc2 'sudo fleet-update'                       # verifies signatures, builds from its own clone
+# 1. Merge to this repo's main on GitHub (merge commit).
+# 2. Pin nixosconfig to the exact merged SHA (never a bare branch-tip update):
+cd ~/nixosconfig && git pull
+nix flake update discogs-src --override-input discogs-src github:abl030/discogs-api/<full-sha>
+git add flake.lock && SSH_AUTH_SOCK='' git commit -m "discogs: description"   # SSH-signed
+# 3. Push to Forgejo master with the token in ENV config, never argv, never echoed:
+#    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://git.ablz.au.extraHeader'
+#    GIT_CONFIG_VALUE_0="Authorization: token $(cat /run/secrets/forgejo/nixbot-token)"
+#    git push origin HEAD:refs/heads/master
+# 4. Build the LXC closure on doc1 and trigger activation:
+nix build ~/nixosconfig#nixosConfigurations.discogs.config.system.build.toplevel --out-link /tmp/discogs-system
+env -u SSH_AUTH_SOCK ssh -i /run/secrets/deploy-trigger/key -o IdentitiesOnly=yes -o BatchMode=yes \
+  root@192.168.1.44 "$(readlink -f /tmp/discogs-system)"
+# 5. Poll until push-activate.service is inactive/success and the generation matches:
+env -u SSH_AUTH_SOCK ssh discogs 'systemctl is-active push-activate.service; readlink -f /nix/var/nix/profiles/system'
 ```
 
-`fleet-update` verifies every commit in range is SSH-signed by a key in
-hosts.nix, then builds from its own root-owned clone. The `discogs-api` service
-restarts automatically on switch. The import does NOT restart (timer-triggered
-oneshot). Do NOT deploy with `nixos-rebuild switch --flake github:...` — GitHub
-nixosconfig is stale.
+The `discogs-api` service restarts automatically on the switch. The import does
+NOT restart (timer-triggered oneshot). The nightly rolling-flake-update CI also
+push-deploys this host, so an unmerged pin is picked up automatically overnight.
 
-## Debugging on doc2
+## Debugging (on the discogs LXC)
 
 ```bash
-ssh doc2 'systemctl status discogs-api.service'
-ssh doc2 'journalctl -u discogs-api.service -f'
-ssh doc2 'journalctl -u discogs-import.service -f'
-ssh doc2 'curl -s http://127.0.0.1:8086/health'
-# The DB nspawn is reachable at 10.20.0.13 (NOT 192.168.100.13, which times out
-# from doc2's host namespace — `machinectl list` shows the live address). The
-# password lives in /run/secrets/discogs-pgpass in POSTGRES_PASSWORD=... format.
-ssh doc2 'export PGPASSWORD=$(sudo cat /run/secrets/discogs-pgpass | grep -oP "POSTGRES_PASSWORD=\K.*"); psql -h 10.20.0.13 -U discogs -d discogs -c "SELECT count(*) FROM release"'
+ssh discogs 'systemctl status discogs-api.service'
+ssh discogs 'journalctl -u discogs-api.service -f'
+ssh discogs 'journalctl -u discogs-import.service -f'
+curl -s http://192.168.1.44:8086/health
+# Postgres is native on the LXC (data in /var/lib/discogs-postgresql);
+# password auth is required — credentials come from the LXC's provisioned
+# secret, not doc2's. The old doc2 nspawn path (10.20.0.13) is gone.
 ```
 
 ## Key Design Decisions
